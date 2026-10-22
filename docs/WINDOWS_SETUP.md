@@ -65,6 +65,69 @@ python -m app.cli backtest --symbols SAMPLE_TCS,SAMPLE_INFY `
 python -m app.cli backtest --symbols TCS --data-dir C:\path\to\your\csvs
 ```
 
+## 7b. Scan a watchlist
+
+A scan is one decision point: it reads the newest bars, refuses to act on
+stale or invalid data, respects the market session, and records what it did.
+
+```powershell
+# One scan against the sample data (pin "now" so sample dates are fresh)
+python -m app.cli scan --symbols SAMPLE_TCS,SAMPLE_INFY `
+    --now 2024-09-10T11:00:00+05:30
+
+# Use a watchlist file and record orders/events to the ledger
+python -m app.cli scan --watchlist my_watchlist.csv --db data\paper_trading.db
+
+# Intraday scanning: tighten the staleness limit to match 5-minute bars
+python -m app.cli scan --strategy intraday --interval 5m `
+    --symbols SAMPLE_INTRADAY_TCS --max-bar-age-minutes 15
+
+# A bounded series of scans, 60s apart (respects provider rate limits)
+python -m app.cli scan --repeat 5 --every 60
+```
+
+`my_watchlist.csv` needs a `symbol` column:
+
+```
+symbol
+SAMPLE_TCS
+SAMPLE_INFY
+```
+
+**Exit codes:** `0` = clean scan, `1` = the scan produced warnings (stale
+data, provider error, invalid data). Useful for scheduled runs — have Task
+Scheduler alert you on a non-zero exit.
+
+### Scheduling it
+
+There is deliberately no daemon. Use Windows Task Scheduler:
+
+```powershell
+# Every 15 minutes on weekdays; adjust to your session and interval
+schtasks /Create /TN "SmartTraderScan" /SC MINUTE /MO 15 /D MON,TUE,WED,THU,FRI `
+  /TR "C:\Users\teja\Documents\projects\smart-trader\.venv\Scripts\python.exe -m app.cli scan --db data\paper_trading.db" `
+  /ST 09:15 /ET 15:30 /K
+```
+
+## 7c. Start the dashboard
+
+```powershell
+python -m app.cli serve --db data\paper_trading.db
+# then open http://127.0.0.1:8000
+```
+
+It is **read-only** and binds to localhost only. It has no authentication —
+do not change `--host` unless you understand that it exposes your ledger to
+your network.
+
+On startup `serve` opens the ledger once for write to apply any additive
+schema migration (a ledger written by an older build is otherwise missing
+tables the dashboard reads). Back the file up first if you want to be safe:
+
+```powershell
+Copy-Item data\paper_trading.db data\paper_trading.db.bak
+```
+
 ## 8. Stopping the app safely
 
 The CLI is a short-lived process; it exits on its own. If you need to stop it
@@ -115,6 +178,29 @@ You are installing a pandas version with no prebuilt wheel for your Python
 version. Use the pinned versions in `requirements.txt` — they were chosen
 because wheels exist for Python 3.14 on Windows. Do not downgrade pandas to
 2.x on Python 3.14; it has no wheel and needs Visual Studio build tools.
+
+**Dashboard shows "The ledger could not be read" / HTTP 503**
+
+Your ledger was written by an older build and is missing tables the dashboard
+reads. Starting `serve` normally migrates it automatically. If it still
+fails, run any backtest against that file to force the migration:
+
+```powershell
+python -m app.cli backtest --symbols SAMPLE_TCS --db data\paper_trading.db
+```
+
+**Every scanned symbol reports `REJECTED_STALE`**
+
+Expected when scanning the bundled sample data, whose newest bar is dated
+2024. Either pin `--now` to a date near the data
+(`--now 2024-09-10T11:00:00+05:30`) or raise `--max-bar-age-minutes`. Do not
+raise it in real use — that guard is what stops a post-outage burst of
+entries.
+
+**`ModuleNotFoundError: No module named 'fastapi'`**
+
+The dashboard dependencies are in `requirements.txt`; re-run
+`pip install -r requirements.txt` inside the activated virtual environment.
 
 **`No CSV file found for symbol 'X'`**
 

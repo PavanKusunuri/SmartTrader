@@ -6,7 +6,7 @@
 > Simulated fills do not guarantee real-world fills or prices. Nothing here
 > is investment advice or a claim of profitability.
 
-## What works today (Milestones 1–2)
+## What works today (Milestones 1–3)
 
 - Loads daily and intraday OHLCV bars from CSV files (bundled synthetic
   samples + your own files).
@@ -30,13 +30,22 @@
   zeros.
 - Honest strategy comparison that **refuses to name a winner** on thin
   evidence.
+- **Watchlist scanner** that refuses to act on stale or invalid data, skips
+  closed sessions and holidays, is idempotent per bar, and isolates a single
+  symbol's provider failure instead of aborting the scan.
+- **Read-only local dashboard** (FastAPI, localhost-only): overview, trades,
+  signals, orders, positions, risk settings, health, event log, DB explorer,
+  and CSV export. Every route is a GET and the database is opened `mode=ro` —
+  enforced by tests.
 - SQLite ledger that survives restarts, plus CSV export of closed trades.
-- 119 passing tests.
+- 160 passing tests.
 
 ## Not built yet
 
-Scanner/watchlist scheduling, Telegram alerts, live data providers, cloud
-deployment. See `CLAUDE.md` for the milestone plan.
+Telegram alerts, live data providers, a supervised scheduler, and cloud
+deployment. The scanner's open positions are also not restored across
+restarts — see [docs/RISK_AND_LIMITATIONS.md](docs/RISK_AND_LIMITATIONS.md).
+See `CLAUDE.md` for the milestone plan.
 
 ## Quick start (Windows PowerShell)
 
@@ -75,6 +84,13 @@ python -m app.cli compare
 # 10. Run with a persistent ledger and a CSV export
 python -m app.cli backtest --symbols SAMPLE_TCS,SAMPLE_INFY `
     --db data\paper_trading.db --export-csv data\exports\trades.csv
+
+# 11. Scan a watchlist (pin --now so the 2024 sample data isn't "stale")
+python -m app.cli scan --symbols SAMPLE_TCS,SAMPLE_INFY `
+    --now 2024-09-10T11:00:00+05:30 --db data\paper_trading.db
+
+# 12. Start the read-only dashboard, then open http://127.0.0.1:8000
+python -m app.cli serve --db data\paper_trading.db
 ```
 
 Full setup notes, including common errors, are in

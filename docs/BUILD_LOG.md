@@ -155,3 +155,82 @@ Limitations added/retained — see `docs/RISK_AND_LIMITATIONS.md`:
 
 Still not built: scanner/watchlist scheduling, Telegram alerts, live data
 providers, cloud deployment. No live order placement exists or is possible.
+
+## 2026-10-22 — Milestone 3
+
+### Scanner (new)
+- `app/scanner/universe.py` — `Watchlist` with normalisation, duplicate
+  rejection, a 50-symbol v1 cap, and CSV loading that errors loudly rather
+  than degrading to "scan nothing".
+- `app/scanner/scanner.py` — `Scanner.scan_once(now)` returning a
+  `ScanReport` of per-symbol outcomes. Implements the CLAUDE.md section 10
+  safety rules: session gating (provider is not even consulted when the
+  market is shut), staleness revalidation (`max_bar_age`) so a recovered
+  outage cannot replay old bars into a burst of entries, per-bar idempotency,
+  and per-symbol failure isolation for provider/strategy exceptions.
+- `now` is injected rather than read from the clock, so scans are
+  reproducible and a backfilled scan cannot mistake stale data for current.
+- CLI `scan` command: `--watchlist`/`--symbols`, `--max-bar-age-minutes`,
+  `--repeat`/`--every` (bounded, not a daemon), `--now`, `--db`. Exits 1 when
+  a scan produced warnings, so an OS scheduler can alert on it.
+
+### Dashboard (repaired and tested)
+- Added `fastapi`, `uvicorn` and (test-only) `httpx` to `requirements.txt`.
+  `serve` was previously broken: it printed "install the dashboard
+  dependencies" while `requirements.txt` contained none of them.
+- Root-caused the 503s on an existing ledger: `data/paper_trading.db` was
+  written by the Milestone 1 schema, and the dashboard opens the ledger
+  read-only so it cannot migrate. `serve` now opens it once for write first,
+  applying the ADDITIVE-ONLY migration. Verified on a copy: all 4 pre-existing
+  trades were preserved and 5 new tables plus 7 new `trades` columns added.
+- `/api/health` previously hardcoded `Scanner -> NOT_IMPLEMENTED`. It now
+  derives scanner health from `app_events`, so it reports UNKNOWN ("has not
+  run against this ledger yet") or HEALTHY with the last scan's timestamp.
+
+### Verification actually performed
+- **160 tests pass** via `.venv\Scripts\python.exe -m pytest tests\`
+  (119 before + 20 scanner + 21 dashboard API).
+- Started the real server (`serve --port 8077`) and issued live HTTP requests
+  with curl: `/api/status`, `/api/health`, `/api/overview`, `/api/trades`,
+  `/api/positions`, `/api/risk` all returned 200, the index page rendered the
+  `PAPER TRADING — NO REAL ORDERS` banner, and the 4 migrated trades were
+  returned correctly.
+- Ran `scan` three ways: clean scan (NO_TRADE, exit 0), stale-data scan
+  (REJECTED_STALE on every symbol with warnings, exit 1), and confirmed the
+  ledger recorded the scan event.
+- **I did not visually inspect the dashboard in a browser** — no browser
+  tooling was available in this environment. HTML was verified by asserting
+  on the served markup, not by looking at a rendered page. Layout/visual
+  regressions would not have been caught.
+
+### Safety properties now covered by tests
+- No dashboard route accepts POST/PUT/PATCH/DELETE.
+- No route path contains place/submit/execute/buy/sell/cancel/modify.
+- `/api/status` reports `live_orders_possible: false`.
+- The read-only connection raises on `DELETE FROM trades`.
+- SQL injection in table names and sort columns is rejected, and the trades
+  table is verified intact afterwards.
+- Missing, empty, and outdated-schema ledgers degrade without a 500.
+
+### Deviation from CLAUDE.md section 4
+CLAUDE.md suggests Streamlit. The dashboard here is FastAPI + server-rendered
+HTML, which was already substantially built when this milestone started.
+Rewriting ~2000 working, read-only, test-covered lines in Streamlit would
+have been churn for no user benefit. The requirement that actually matters —
+"keep core trading logic independent of the UI" — holds: the dashboard only
+reads the SQLite ledger and imports no strategy or broker code.
+
+### Known gaps carried into Milestone 4
+- Scanner portfolio is in-memory per process; open positions are NOT restored
+  on restart, so repeated single-shot scans each start flat.
+- Live scan fills at the latest close (no "next bar" exists yet), which is
+  more optimistic than the backtest's next-bar-open model. Scan and backtest
+  output are therefore not directly comparable.
+- Idempotency is per-process only; a fresh process could re-act on a bar a
+  previous process already handled.
+- No scheduler, no retry/backoff across invocations, nothing detects a
+  missed scan. Telegram alerts and live data providers remain unbuilt.
+- `.gitignore` gained `*.db-wal` / `*.db-shm`, needed now that the ledger
+  runs in WAL mode.
+
+No live order placement exists or is possible.

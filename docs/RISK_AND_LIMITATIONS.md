@@ -71,6 +71,48 @@ These are real weaknesses, deliberately documented rather than hidden:
    the unverified cost and slippage assumptions above. A small error in
    those rates changes its sign.
 
+## Scanner limitations (Milestone 3)
+
+1. **The scanner's portfolio does not survive a restart.** Virtual cash and
+   open positions live in memory for the life of one `scan` process. Closed
+   trades and orders are written to the ledger, but open positions are NOT
+   reloaded on the next invocation. So repeated single-shot scans each start
+   flat. Until this is fixed, the scanner is a signal-generation and
+   decision-logging tool, not a continuous portfolio simulator.
+2. **Live scanning fills at the latest close, not the next bar's open.** The
+   backtest deliberately uses next-bar-open fills, but a live scan has no
+   "next bar" yet, so the only price available is the newest close. This is
+   weaker than the backtest model and makes scan fills more optimistic than
+   backtest fills. Do not compare scan output to backtest output as if they
+   used the same fill model.
+3. **Staleness is the only freshness guard.** `--max-bar-age-minutes`
+   rejects old bars, which is what prevents a post-outage burst of entries.
+   Set it to match your bar interval: the 7200-minute (5-day) default suits
+   daily bars and is far too permissive for 5-minute intraday scanning
+   (use ~15).
+4. **No scheduler.** Scans run on demand or under an OS scheduler (Task
+   Scheduler/cron). There is no supervised daemon, no retry/backoff policy
+   across invocations, and nothing that notices a scan did not happen.
+5. **Idempotency is per-process.** The scanner will not re-trade the same
+   (symbol, bar) within one process. Across restarts that memory is lost, so
+   a fresh process could act on a bar a previous process already acted on.
+   The deterministic signal ID limits the damage within a process but does
+   not deduplicate across them.
+
+## Dashboard limitations
+
+1. **No authentication.** It binds to `127.0.0.1` by default. Changing
+   `--host` exposes your ledger to anyone who can reach the port.
+2. **Read-only by construction** — every route is a GET, the database is
+   opened with SQLite's `mode=ro`, and there is no endpoint that places,
+   modifies, or cancels an order. This is enforced by tests, not just by
+   intention.
+3. **An older ledger is migrated on `serve` startup.** The dashboard opens
+   the ledger read-only and cannot migrate it, so `serve` opens it once for
+   write first. The migration is additive only (`CREATE TABLE IF NOT EXISTS`
+   / `ALTER TABLE ADD COLUMN`) and does not drop or rewrite rows, but it
+   does modify your file. Back it up first if that matters to you.
+
 ## About the bundled sample data
 
 `data/samples/SAMPLE_*.csv` is a deterministic synthetic random walk, not real

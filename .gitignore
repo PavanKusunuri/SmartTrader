@@ -19,6 +19,11 @@ env/
 *.db
 *.sqlite3
 *.sqlite3-journal
+# SQLite WAL sidecars (sqlite.py uses journal_mode=WAL)
+*.db-wal
+*.db-shm
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Generated run output (sample CSVs under data/samples/ ARE committed)
 data/exports/

@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from app.backtest.engine import BacktestResult, run_backtest
 from app.backtest.evaluation import (
@@ -23,12 +26,17 @@ from app.backtest.evaluation import (
 from app.config import AppConfig
 from app.data.csv_provider import CsvProvider
 from app.market_calendar import MarketSession, load_holidays
+from app.paper.broker import PaperBroker
+from app.scanner.scanner import ScanOutcome, Scanner
+from app.scanner.universe import InvalidWatchlist, Watchlist
 from app.storage.persist import persist_run
 from app.storage.sqlite import RESET_CONFIRMATION_TOKEN, SqliteRepository
 from app.strategies.intraday import IntradayMomentumStrategy
 from app.strategies.swing import SwingMAStrategy
 
 BANNER = "=" * 64 + "\n  PAPER TRADING — NO REAL ORDERS (simulated fills only)\n" + "=" * 64
+
+IST = ZoneInfo("Asia/Kolkata")
 
 DEFAULT_SAMPLES_DIR = Path(__file__).resolve().parent.parent / "data" / "samples"
 
@@ -275,6 +283,101 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Runs one watchlist scan (or a bounded series of them).
+
+    Single-shot by default. CLAUDE.md section 10 says not to require a
+    continuously running process outside market hours, so scheduling is left
+    to the OS (Task Scheduler / cron) rather than a daemon living in here.
+    """
+
+    print(BANNER)
+    config = _config_from_args(args)
+
+    try:
+        watchlist = (
+            Watchlist.from_csv(args.watchlist)
+            if args.watchlist
+            else Watchlist.from_list(args.symbols.split(","))
+        )
+    except InvalidWatchlist as exc:
+        print(f"\nInvalid watchlist: {exc}")
+        return 2
+
+    session = _build_session(args)
+    strategy = _strategy_factory(args, config)()
+    broker = PaperBroker(config)
+    scanner = Scanner(
+        provider=CsvProvider(args.data_dir),
+        strategy=strategy,
+        broker=broker,
+        watchlist=watchlist,
+        session=session,
+        interval=args.interval,
+        max_bar_age=timedelta(minutes=args.max_bar_age_minutes),
+    )
+
+    repo = SqliteRepository(args.db) if args.db else None
+    print(f"\nWatchlist   : {', '.join(watchlist)} ({len(watchlist)} symbols)")
+    print(f"Strategy    : {strategy.name}")
+    print(f"Session     : {'enforced' if session else 'none (daily/swing mode)'}")
+    print(f"Max bar age : {args.max_bar_age_minutes} minutes")
+    print(
+        "\nNOTE: the scanner's virtual cash and open positions live in memory for\n"
+        "this process only. Closed trades are written to the ledger, but open\n"
+        "positions are NOT restored on restart (see docs/RISK_AND_LIMITATIONS.md)."
+    )
+
+    exit_code = 0
+    for scan_number in range(1, args.repeat + 1):
+        now = datetime.now(tz=IST) if args.now is None else datetime.fromisoformat(args.now)
+        report = scanner.scan_once(now)
+
+        print(f"\n--- scan {scan_number}/{args.repeat} at {report.scanned_at.isoformat()} ---")
+        for r in report.results:
+            bar_ts = r.bar_timestamp.isoformat() if r.bar_timestamp else "-"
+            print(f"  {r.symbol:<22}{r.outcome.value:<20}{bar_ts}")
+            print(f"      {r.detail}")
+
+        if report.warnings:
+            exit_code = 1
+            print("\n  WARNINGS:")
+            for warning in report.warnings:
+                print(f"    ! {warning}")
+
+        if repo is not None:
+            for order in report.orders_created:
+                repo.save_order(order)
+            for trade in broker.portfolio.trades:
+                repo.save_trade(trade)
+            for warning in report.warnings:
+                repo.log_event(
+                    severity="WARNING", component="scanner", message=warning,
+                    detail={"scanned_at": report.scanned_at.isoformat()},
+                )
+            repo.log_event(
+                severity="INFO", component="scanner",
+                message=f"scan completed: {len(report.results)} symbols",
+                detail={
+                    "traded": report.count(ScanOutcome.TRADED),
+                    "no_trade": report.count(ScanOutcome.NO_TRADE),
+                    "skipped_session": report.count(ScanOutcome.SKIPPED_SESSION),
+                    "rejected_stale": report.count(ScanOutcome.REJECTED_STALE),
+                    "errors": report.count(ScanOutcome.ERROR),
+                },
+            )
+
+        if scan_number < args.repeat:
+            time.sleep(args.every)
+
+    if repo is not None:
+        print(f"\nLedger: {args.db} (total trades stored: {repo.trade_count()})")
+        repo.close()
+
+    print(DISCLAIMER)
+    return exit_code
+
+
 def cmd_reset(args: argparse.Namespace) -> int:
     """Deletes all simulated history. Interactive and explicit by design:
     CLAUDE.md section 9 requires a reset to be confirmed, never silent."""
@@ -341,6 +444,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
             "         start and show empty states. Create it with:\n"
             "           python -m app.cli backtest --db data\\paper_trading.db"
         )
+    else:
+        # The dashboard opens the ledger read-only and therefore cannot migrate
+        # it. A ledger written by an older build is missing tables/columns the
+        # dashboard reads, which otherwise surfaces as opaque "could not be
+        # read" errors. Opening it for write here applies the ADDITIVE-ONLY
+        # migration (ALTER TABLE ADD COLUMN / CREATE TABLE IF NOT EXISTS), which
+        # never drops or rewrites existing rows.
+        try:
+            repo = SqliteRepository(db_path)
+            trade_count = repo.trade_count()
+            repo.close()
+            print(f"Schema       : up to date ({trade_count} trades on record)")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"WARNING: could not open the ledger for a schema check: {exc}\n"
+                "         The dashboard will start but may show errors. Back up\n"
+                f"         the file before investigating:  Copy-Item '{args.db}' '{args.db}.bak'"
+            )
     print(f"Dashboard    : http://{args.host}:{args.port}")
     print("Access       : read-only; bound to localhost only by default.")
     print("\nPress Ctrl+C to stop.\n")
@@ -404,6 +525,30 @@ def main(argv: list[str] | None = None) -> int:
     cm.add_argument("--data-dir", default=str(DEFAULT_SAMPLES_DIR))
     cm.add_argument("--starting-cash", type=float, default=None)
     cm.set_defaults(func=cmd_compare)
+
+    sc = sub.add_parser("scan", help="Run one watchlist scan (session- and staleness-aware)")
+    sc.add_argument("--symbols", default="SAMPLE_TCS,SAMPLE_INFY")
+    sc.add_argument(
+        "--watchlist", default=None,
+        help="CSV with a 'symbol' column; overrides --symbols",
+    )
+    add_shared_args(sc)
+    sc.add_argument("--db", default=None, help="SQLite path to record orders and events")
+    sc.add_argument(
+        "--max-bar-age-minutes", type=int, default=7200,
+        help="Refuse to trade if the newest bar is older than this. Default 7200 "
+             "(5 days) suits daily bars; use ~15 for 5-minute intraday scanning.",
+    )
+    sc.add_argument("--repeat", type=int, default=1, help="Number of scans to run")
+    sc.add_argument(
+        "--every", type=int, default=60,
+        help="Seconds between scans when --repeat > 1 (respect provider rate limits)",
+    )
+    sc.add_argument(
+        "--now", default=None,
+        help="ISO timestamp to treat as 'now' (for testing against sample data)",
+    )
+    sc.set_defaults(func=cmd_scan)
 
     rs = sub.add_parser("reset", help="Delete all simulated history (asks for confirmation)")
     rs.add_argument("--db", default="data/paper_trading.db")

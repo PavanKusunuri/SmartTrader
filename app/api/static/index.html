@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Trader — Paper Trading</title>
+<script src="/static/vendor/tailwind.js"></script>
+<script>
+  // Vendored Tailwind runs locally, so the dashboard works with no internet
+  // connection. Configure before first paint to avoid a flash of unstyled text.
+  tailwind.config = {
+    darkMode: ['variant', [
+      '@media (prefers-color-scheme: dark) { &:not(.light *) }',
+      '&:is(.dark *)',
+    ]],
+    theme: {
+      extend: {
+        fontFamily: {
+          sans: ['Segoe UI', 'system-ui', '-apple-system', 'Helvetica Neue', 'Arial', 'sans-serif'],
+          mono: ['Cascadia Mono', 'Consolas', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+        },
+      },
+    },
+  };
+</script>
+<style>
+  /* Tabular figures keep currency columns aligned so values are comparable
+     down a column rather than ragged. */
+  .nums { font-variant-numeric: tabular-nums; }
+  [data-page] { display: none; }
+  [data-page].active { display: block; }
+  /* Visible keyboard focus everywhere; never remove the indicator. */
+  :focus-visible { outline: 2px solid #4f46e5; outline-offset: 2px; border-radius: 2px; }
+  .scroll-x { overflow-x: auto; }
+  @media print { #sidebar, #topbar { display: none; } }
+</style>
+</head>
+<body class="h-full bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-200 font-sans antialiased">
+
+<a href="#main" class="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:m-2 focus:rounded focus:bg-indigo-600 focus:px-3 focus:py-2 focus:text-white">Skip to content</a>
+
+<!-- PAPER TRADING banner: required by CLAUDE.md section 3; never hide or soften. -->
+<div role="status" class="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-b border-amber-300 bg-amber-100 px-4 py-1.5 text-center text-xs font-semibold tracking-wide text-amber-900 dark:border-amber-700/60 dark:bg-amber-950 dark:text-amber-200">
+  <span>PAPER TRADING — NO REAL ORDERS</span>
+  <span class="font-normal opacity-80">Simulated fills only. No broker integration. Not investment advice.</span>
+</div>
+
+<div class="flex min-h-[calc(100%-2rem)]">
+
+  <!-- ---------------------------------------------------------- sidebar -->
+  <aside id="sidebar" class="fixed inset-y-0 left-0 z-40 w-64 -translate-x-full border-r border-slate-200 bg-white transition-transform duration-200 lg:static lg:translate-x-0 dark:border-slate-800 dark:bg-slate-900">
+    <div class="flex h-full flex-col">
+      <div class="flex items-center gap-2 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+        <span aria-hidden="true" class="grid h-8 w-8 place-items-center rounded bg-indigo-600 text-sm font-bold text-white">ST</span>
+        <div class="min-w-0">
+          <div class="truncate text-sm font-semibold">Smart Trader</div>
+          <div class="truncate text-[11px] text-slate-500 dark:text-slate-400">Indian equities · research</div>
+        </div>
+        <button id="sidebar-close" class="ml-auto rounded p-1 text-slate-500 hover:bg-slate-100 lg:hidden dark:hover:bg-slate-800" aria-label="Close navigation">✕</button>
+      </div>
+
+      <nav aria-label="Main" class="flex-1 overflow-y-auto px-2 py-3">
+        <ul id="nav" class="space-y-0.5 text-sm"></ul>
+      </nav>
+
+      <div class="border-t border-slate-200 px-4 py-3 text-[11px] leading-relaxed text-slate-500 dark:border-slate-800 dark:text-slate-400">
+        <div id="sidebar-db" class="truncate font-mono"></div>
+        <div id="sidebar-access" class="mt-1"></div>
+      </div>
+    </div>
+  </aside>
+  <div id="sidebar-scrim" class="fixed inset-0 z-30 hidden bg-slate-900/40 lg:hidden"></div>
+
+  <!-- ------------------------------------------------------------- main -->
+  <div class="flex min-w-0 flex-1 flex-col">
+
+    <header id="topbar" class="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95">
+      <div class="flex flex-wrap items-center gap-3 px-4 py-2.5">
+        <button id="sidebar-open" class="rounded p-1.5 text-slate-600 hover:bg-slate-100 lg:hidden dark:text-slate-300 dark:hover:bg-slate-800" aria-label="Open navigation" aria-expanded="false">☰</button>
+        <h1 id="page-title" class="text-base font-semibold">Overview</h1>
+
+        <div class="ml-auto flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+          <div class="flex items-center gap-1.5" title="Market session in Asia/Kolkata">
+            <span id="session-dot" aria-hidden="true" class="h-2 w-2 rounded-full bg-slate-300"></span>
+            <span class="text-slate-500 dark:text-slate-400">Market</span>
+            <span id="session-text" class="font-medium">—</span>
+          </div>
+          <div class="flex items-center gap-1.5" title="Ledger database status">
+            <span id="db-dot" aria-hidden="true" class="h-2 w-2 rounded-full bg-slate-300"></span>
+            <span class="text-slate-500 dark:text-slate-400">Ledger</span>
+            <span id="db-text" class="font-medium">—</span>
+          </div>
+          <div class="text-slate-500 dark:text-slate-400">
+            Data: <span id="provider-text" class="font-medium text-slate-700 dark:text-slate-200">—</span>
+          </div>
+          <div class="text-slate-500 dark:text-slate-400">
+            Updated <span id="refreshed-text" class="nums font-medium text-slate-700 dark:text-slate-200">—</span>
+          </div>
+          <button id="refresh" class="rounded border border-slate-300 px-2 py-1 font-medium hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800">Refresh</button>
+          <button id="theme-toggle" class="rounded border border-slate-300 px-2 py-1 font-medium hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800" aria-label="Toggle colour theme">Theme</button>
+        </div>
+      </div>
+      <div id="global-alert" class="hidden border-t border-rose-200 bg-rose-50 px-4 py-2 text-xs text-rose-800 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200"></div>
+    </header>
+
+    <main id="main" class="min-w-0 flex-1 p-4 lg:p-6">
+      <section data-page="overview" class="active" aria-labelledby="page-title"></section>
+      <section data-page="trades"></section>
+      <section data-page="signals"></section>
+      <section data-page="orders"></section>
+      <section data-page="positions"></section>
+      <section data-page="strategies"></section>
+      <section data-page="risk"></section>
+      <section data-page="marketdata"></section>
+      <section data-page="database"></section>
+      <section data-page="health"></section>
+    </main>
+
+    <footer class="border-t border-slate-200 px-4 py-3 text-[11px] leading-relaxed text-slate-500 dark:border-slate-800 dark:text-slate-400">
+      Research and paper-trading tool. Every fill, price and P&amp;L figure shown is
+      simulated from recorded historical bars and does not guarantee real-world
+      fills or prices. Cost and tax rates are user-configurable assumptions that
+      have not been verified against current official sources.
+    </footer>
+  </div>
+</div>
+
+<!-- Detail drawer, shared by every page that has a row detail view. -->
+<div id="drawer-scrim" class="fixed inset-0 z-40 hidden bg-slate-900/40"></div>
+<aside id="drawer" class="fixed inset-y-0 right-0 z-50 w-full max-w-xl translate-x-full overflow-y-auto border-l border-slate-200 bg-white shadow-xl transition-transform duration-200 dark:border-slate-800 dark:bg-slate-900" role="dialog" aria-modal="true" aria-labelledby="drawer-title" tabindex="-1">
+  <div class="sticky top-0 flex items-center gap-3 border-b border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900">
+    <h2 id="drawer-title" class="text-sm font-semibold">Detail</h2>
+    <button id="drawer-close" class="ml-auto rounded p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800" aria-label="Close detail">✕</button>
+  </div>
+  <div id="drawer-body" class="px-4 py-4 text-sm"></div>
+</aside>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

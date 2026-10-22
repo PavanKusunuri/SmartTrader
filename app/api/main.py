@@ -1,0 +1,1298 @@
+"""FastAPI application for the local paper-trading dashboard.
+
+PAPER TRADING — NO REAL ORDERS. Every route here is a GET. There is no
+endpoint that places, modifies, or cancels an order, no endpoint that writes
+to the ledger, and no endpoint that executes caller-supplied SQL. The database
+is opened with SQLite's `mode=ro` flag on every request, so a read path cannot
+write even if a query were wrong.
+
+Operational notes:
+- Bound to 127.0.0.1 by default (see app/cli.py `serve`). The app has no
+  authentication, so exposing it on a network interface would expose the
+  ledger to anyone who can reach the port.
+- A missing or unreadable database is reported as a degraded status with empty
+  results, not a crash: the dashboard stays usable and says what is wrong.
+- Errors return a short message. Stack traces and file-system paths beyond the
+  configured ledger location are never sent to the browser.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Iterator
+from zoneinfo import ZoneInfo
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.api import queries as q
+from app.api.derive import (
+    cost_assumptions_from_run,
+    derive_order_economics,
+    position_marks,
+)
+from app.config import AppConfig
+from app.storage.sqlite import EXPLORABLE_TABLES
+
+IST = ZoneInfo("Asia/Kolkata")
+
+PAPER_TRADING_BANNER = "PAPER TRADING — NO REAL ORDERS"
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Component health vocabulary. UNKNOWN and NOT_IMPLEMENTED exist so the health
+# page never claims a component is healthy when it was never checked or never
+# built (CLAUDE.md section 12 / dashboard spec section 12).
+HEALTHY = "HEALTHY"
+DEGRADED = "DEGRADED"
+UNHEALTHY = "UNHEALTHY"
+UNKNOWN = "UNKNOWN"
+NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+
+
+class LedgerUnavailable(Exception):
+    """The ledger file could not be opened read-only."""
+
+
+def _now_ist() -> datetime:
+    return datetime.now(tz=IST)
+
+
+def _data_kind(source: str | None, filename: str | None = None) -> str:
+    """Labels a dataset so the UI can never present sample data as real.
+
+    Nothing in v1 is live: the only provider reads CSV files. A file whose name
+    marks it as a bundled sample is labelled SAMPLE_SYNTHETIC; any other CSV is
+    user-supplied history, labelled HISTORICAL_CSV. The word "live" is not a
+    possible return value.
+    """
+
+    name = (filename or source or "").upper()
+    if "SAMPLE" in name:
+        return "SAMPLE_SYNTHETIC"
+    return "HISTORICAL_CSV"
+
+
+def create_app(db_path: str, samples_dir: str | None = None) -> FastAPI:
+    ledger_path = Path(db_path)
+    data_dir = Path(samples_dir) if samples_dir else Path("data/samples")
+    config = AppConfig()
+
+    app = FastAPI(
+        title="Smart Trader — paper-trading dashboard",
+        description=(
+            "Read-only dashboard over the simulated paper-trading ledger. "
+            "No live orders, no broker integration."
+        ),
+        version="1.0.0",
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+    )
+
+    # ------------------------------------------------------------ plumbing
+
+    def get_conn() -> Iterator[sqlite3.Connection]:
+        """Opens a per-request read-only connection. A per-request connection
+        avoids sharing one across threads (sqlite3 objects are not thread-safe)
+        and guarantees the handle is closed even on error."""
+
+        from app.storage.sqlite import open_readonly
+
+        try:
+            conn = open_readonly(ledger_path)
+        except sqlite3.OperationalError as exc:
+            raise LedgerUnavailable(str(exc)) from exc
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    @app.exception_handler(LedgerUnavailable)
+    async def _ledger_unavailable(request: Request, exc: LedgerUnavailable) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "ledger_unavailable",
+                "detail": (
+                    f"The paper-trading database at {ledger_path.name} could not be "
+                    "opened for reading. Run a backtest with --db to create it."
+                ),
+            },
+        )
+
+    @app.exception_handler(q.InvalidQuery)
+    async def _invalid_query(request: Request, exc: q.InvalidQuery) -> JSONResponse:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_request", "detail": str(exc)}
+        )
+
+    @app.exception_handler(sqlite3.Error)
+    async def _sqlite_error(request: Request, exc: sqlite3.Error) -> JSONResponse:
+        # Deliberately generic: a database error message can leak schema or
+        # path details, and a stack trace must never reach the browser.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "database_error",
+                "detail": "The ledger could not be read. Check the server log for details.",
+            },
+        )
+
+    def _run_scope(conn: sqlite3.Connection, run_id: str | None) -> dict[str, Any] | None:
+        """Resolves the run a page is scoped to: the one asked for, else the
+        most recent. There is no live portfolio in v1 — every portfolio figure
+        belongs to a specific recorded run, and the UI says which."""
+
+        if run_id:
+            run = q.get_run(conn, run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail=f"unknown run_id {run_id}")
+            return run
+        return q.latest_run(conn)
+
+    def _csv_response(filename: str, header: list[str], rows: list[list[Any]]) -> StreamingResponse:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(header)
+        writer.writerows(rows)
+        buffer.seek(0)
+        return StreamingResponse(
+            iter([buffer.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # -------------------------------------------------------------- status
+
+    @app.get("/api/status")
+    def status() -> dict[str, Any]:
+        """Top-bar status. Never raises: a broken ledger is reported, not thrown,
+        so the dashboard shell always renders."""
+
+        now = _now_ist()
+        db_status, db_detail, last_write = UNKNOWN, None, None
+        try:
+            from app.storage.sqlite import open_readonly
+
+            conn = open_readonly(ledger_path)
+            try:
+                conn.execute("SELECT 1").fetchone()
+                counts = {
+                    t: conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
+                    for t in EXPLORABLE_TABLES
+                }
+                stamps = []
+                for table, column in (
+                    ("trades", "recorded_at"), ("orders", "recorded_at"),
+                    ("signals", "recorded_at"), ("app_events", "ts"),
+                ):
+                    value = conn.execute(f'SELECT MAX("{column}") FROM "{table}"').fetchone()[0]
+                    if value:
+                        stamps.append(value)
+                last_write = max(stamps) if stamps else None
+                db_status = HEALTHY
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            db_status, db_detail, counts = UNHEALTHY, str(exc)[:200], {}
+        except sqlite3.Error:
+            db_status, db_detail, counts = UNHEALTHY, "database read error", {}
+
+        session = _session_status(now)
+        csv_files = sorted(data_dir.glob("*.csv")) if data_dir.exists() else []
+
+        return {
+            "mode": PAPER_TRADING_BANNER,
+            "live_orders_possible": False,
+            "server_time_ist": now.isoformat(),
+            "timezone": "Asia/Kolkata",
+            "market_session": session,
+            "database": {
+                "status": db_status,
+                "detail": db_detail,
+                "path": str(ledger_path),
+                "exists": ledger_path.exists(),
+                "last_write_at": last_write,
+                "table_counts": counts,
+            },
+            "data_provider": {
+                "name": "CsvProvider",
+                "kind": "file-based (no network, no streaming)",
+                "directory": str(data_dir),
+                "directory_exists": data_dir.exists(),
+                "symbol_count": len(csv_files),
+                "streaming": False,
+                "note": (
+                    "Bars are read from CSV files on demand. This is not a live or "
+                    "delayed market feed, and no quote is real-time."
+                ),
+            },
+        }
+
+    def _session_status(now: datetime) -> dict[str, Any]:
+        """Market-session state in IST.
+
+        The session times are the app's configurable defaults and are NOT
+        verified against a current exchange circular; the holiday list is
+        empty unless the user supplies one, so a holiday can only be detected
+        as such if it falls on a weekend. Both caveats are returned to the UI
+        rather than hidden.
+        """
+
+        try:
+            from app.market_calendar import MarketSession
+
+            session = MarketSession()
+            return {
+                "status": "OPEN" if session.is_in_session(now) else "CLOSED",
+                "is_trading_day": session.is_trading_day(now.date()),
+                "open_time": session.open_time.isoformat(),
+                "close_time": session.close_time.isoformat(),
+                "entry_cutoff": session.entry_cutoff.isoformat(),
+                "holidays_configured": len(session.holidays),
+                "caveat": (
+                    "Session times are unverified configurable defaults. No holiday "
+                    "list is loaded unless you supply one, so a weekday holiday is "
+                    "not detected."
+                ),
+            }
+        except Exception:  # noqa: BLE001 - report unknown rather than guess a state
+            return {
+                "status": UNKNOWN,
+                "caveat": "Market calendar unavailable; session state could not be determined.",
+            }
+
+    # ------------------------------------------------------------ overview
+
+    @app.get("/api/overview")
+    def overview(
+        run_id: str | None = None, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        """Portfolio summary for one recorded run.
+
+        Formulas (all from persisted rows, nothing hardcoded):
+          starting_capital = runs.starting_cash
+          cash             = last equity_snapshots.cash for the run
+          realized_net_pnl = SUM(trades.net_pnl)
+          gross_pnl        = SUM(trades.gross_pnl)
+          total_costs      = SUM(trades.costs)
+          invested         = SUM(open position quantity * avg_entry_price)
+          unrealized_pnl   = SUM(quantity * (last_price - avg_entry_price)),
+                             only over positions that HAVE a recorded price
+          portfolio_value  = cash + SUM(quantity * last_price)
+          max_drawdown     = max peak-to-trough fall of the equity curve
+        """
+
+        run = _run_scope(conn, run_id)
+        if run is None:
+            return {
+                "has_data": False,
+                "message": (
+                    "No backtest runs are recorded yet. Run: "
+                    "python -m app.cli backtest --db data\\paper_trading.db"
+                ),
+            }
+
+        rid = run["run_id"]
+        agg = q.run_trade_aggregates(conn, rid)
+        positions = q.query_positions(conn, rid)
+        curve = q.equity_curve(conn, rid)
+
+        last_snapshot = conn.execute(
+            "SELECT equity, cash, position_count FROM equity_snapshots "
+            "WHERE run_id = ? ORDER BY seq DESC LIMIT 1",
+            (rid,),
+        ).fetchone()
+        cash = last_snapshot["cash"] if last_snapshot else None
+
+        invested = 0.0
+        unrealized = 0.0
+        marked_value = 0.0
+        missing_prices: list[str] = []
+        for position in positions:
+            marks = position_marks(position, None)
+            invested += marks["cost_basis"] or 0.0
+            if marks["price_available"]:
+                unrealized += marks["unrealized_pnl"] or 0.0
+                marked_value += marks["market_value"] or 0.0
+            else:
+                missing_prices.append(position["symbol"])
+
+        portfolio_value = (cash + marked_value) if cash is not None else None
+
+        return {
+            "has_data": True,
+            "run": _public_run(run),
+            "starting_capital": run["starting_cash"],
+            "cash": cash,
+            "portfolio_value": portfolio_value,
+            "final_equity_recorded": run["final_equity"],
+            "invested": invested,
+            "realized_net_pnl": agg["net_pnl"],
+            "gross_pnl": agg["gross_pnl"],
+            "total_costs": agg["costs"],
+            "unrealized_pnl": unrealized if positions and not missing_prices else (
+                unrealized if positions else 0.0
+            ),
+            "unrealized_pnl_incomplete": bool(missing_prices),
+            "missing_price_symbols": missing_prices,
+            "open_position_count": len(positions),
+            "trade_count": agg["trade_count"],
+            "win_count": agg["win_count"],
+            "loss_count": agg["loss_count"],
+            "win_rate": agg["win_rate"],
+            "avg_win": agg["avg_win"],
+            "avg_loss": agg["avg_loss"],
+            "expectancy": agg["expectancy"],
+            "ambiguous_trade_count": agg["ambiguous_count"],
+            "max_drawdown_pct": q.max_drawdown(conn, rid),
+            "equity_curve": curve,
+            "reconciliation_problems": _json_or(run.get("reconciliation_json"), []),
+            "disclaimer": (
+                "These figures describe one simulated run on the recorded dataset. "
+                "Simulated fills do not guarantee real-world fills or prices."
+            ),
+        }
+
+    # -------------------------------------------------------------- trades
+
+    @app.get("/api/trades")
+    def trades(
+        page: int = 1,
+        page_size: int = q.DEFAULT_PAGE_SIZE,
+        search: str | None = None,
+        symbol: str | None = None,
+        strategy: str | None = None,
+        status: str | None = None,
+        direction: str | None = None,
+        run_id: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        result = q.query_trades(
+            conn, page=page, page_size=page_size, search=search, symbol=symbol,
+            strategy=strategy, status=status, direction=direction, run_id=run_id,
+            date_from=date_from, date_to=date_to, sort=sort, order=order,
+        )
+        return {
+            **result.to_dict(),
+            "filter_options": {
+                "symbols": q.distinct_values(conn, "trades", "symbol"),
+                "strategies": q.distinct_values(conn, "trades", "strategy_name"),
+                "statuses": q.distinct_values(conn, "trades", "status"),
+                "directions": q.distinct_values(conn, "trades", "side"),
+            },
+            "sortable": list(q.TRADE_SORTS),
+        }
+
+    @app.get("/api/trades/{trade_id}")
+    def trade_detail(
+        trade_id: str, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        detail = q.get_trade(conn, trade_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="trade not found")
+
+        run = q.get_run(conn, detail["trade"].get("run_id")) if detail["trade"].get("run_id") else None
+        costs = cost_assumptions_from_run(run)
+        detail["orders"] = [
+            {**o, "economics": derive_order_economics(o, costs)} for o in detail["orders"]
+        ]
+        detail["signals"] = [_with_parsed_inputs(s) for s in detail["signals"]]
+        detail["run"] = _public_run(run) if run else None
+        detail["cost_assumptions"] = costs.model_dump() if costs else None
+        return detail
+
+    @app.get("/api/export/trades.csv")
+    def export_trades(
+        search: str | None = None,
+        symbol: str | None = None,
+        strategy: str | None = None,
+        status: str | None = None,
+        direction: str | None = None,
+        run_id: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> StreamingResponse:
+        """Exports the CURRENTLY FILTERED trades, not the whole table, so what
+        you download matches what you were looking at."""
+
+        result = q.query_trades(
+            conn, page=1, page_size=q.MAX_PAGE_SIZE, search=search, symbol=symbol,
+            strategy=strategy, status=status, direction=direction, run_id=run_id,
+            date_from=date_from, date_to=date_to, sort=sort, order=order,
+        )
+        header = [
+            "trade_id", "run_id", "symbol", "strategy_name", "side", "status",
+            "entry_at", "entry_price", "exit_at", "exit_price", "quantity",
+            "stop_loss", "target", "gross_pnl", "costs", "net_pnl",
+            "exit_reason", "ambiguous_exit",
+        ]
+        rows = [[row.get(k) for k in header] for row in result.rows]
+        return _csv_response("paper_trades.csv", header, rows)
+
+    # ------------------------------------------------------------- signals
+
+    @app.get("/api/signals")
+    def signals(
+        page: int = 1,
+        page_size: int = q.DEFAULT_PAGE_SIZE,
+        search: str | None = None,
+        symbol: str | None = None,
+        strategy: str | None = None,
+        action: str | None = None,
+        outcome: str | None = None,
+        run_id: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        result = q.query_signals(
+            conn, page=page, page_size=page_size, search=search, symbol=symbol,
+            strategy=strategy, action=action, outcome=outcome, run_id=run_id,
+            date_from=date_from, date_to=date_to, sort=sort, order=order,
+        )
+        counts = q.signal_action_counts(conn, run_id)
+        actionable = counts.get("BUY", 0) + counts.get("SELL", 0)
+        return {
+            **result.to_dict(),
+            "action_counts": counts,
+            # Surfaced so the UI can show an explicit NO TRADE state rather
+            # than an empty-looking table when the strategy found no setup.
+            "no_trade_only": actionable == 0 and counts.get("NO_TRADE", 0) > 0,
+            "filter_options": {
+                "symbols": q.distinct_values(conn, "signals", "symbol"),
+                "strategies": q.distinct_values(conn, "signals", "strategy_name"),
+                "actions": q.distinct_values(conn, "signals", "action"),
+                "outcomes": q.distinct_values(conn, "signals", "outcome"),
+            },
+            "sortable": list(q.SIGNAL_SORTS),
+            "note": (
+                "Signal strength/confidence is not shown because no strategy in this "
+                "version computes one. Only the recorded rule inputs are displayed."
+            ),
+        }
+
+    @app.get("/api/signals/{run_id}/{signal_id:path}")
+    def signal_detail(
+        run_id: str, signal_id: str, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        detail = q.get_signal(conn, run_id, signal_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="signal not found")
+        detail["signal"] = _with_parsed_inputs(detail["signal"])
+        return detail
+
+    @app.get("/api/export/signals.csv")
+    def export_signals(
+        search: str | None = None,
+        symbol: str | None = None,
+        strategy: str | None = None,
+        action: str | None = None,
+        outcome: str | None = None,
+        run_id: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> StreamingResponse:
+        result = q.query_signals(
+            conn, page=1, page_size=q.MAX_PAGE_SIZE, search=search, symbol=symbol,
+            strategy=strategy, action=action, outcome=outcome, run_id=run_id,
+            date_from=date_from, date_to=date_to,
+        )
+        header = [
+            "run_id", "signal_id", "symbol", "timestamp", "strategy_name", "action",
+            "outcome", "reason", "stop_loss", "target", "order_id", "trade_id",
+        ]
+        rows = [[row.get(k) for k in header] for row in result.rows]
+        return _csv_response("paper_signals.csv", header, rows)
+
+    # -------------------------------------------------------------- orders
+
+    @app.get("/api/orders")
+    def orders(
+        page: int = 1,
+        page_size: int = q.DEFAULT_PAGE_SIZE,
+        search: str | None = None,
+        symbol: str | None = None,
+        side: str | None = None,
+        status: str | None = None,
+        run_id: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        result = q.query_orders(
+            conn, page=page, page_size=page_size, search=search, symbol=symbol,
+            side=side, status=status, run_id=run_id, date_from=date_from,
+            date_to=date_to, sort=sort, order=order,
+        )
+
+        # Cost assumptions differ per run, so fetch each run once rather than
+        # once per order row.
+        run_ids = {row.get("run_id") for row in result.rows if row.get("run_id")}
+        costs_by_run = {
+            rid: cost_assumptions_from_run(q.get_run(conn, rid)) for rid in run_ids
+        }
+        rows = [
+            {**row, "economics": derive_order_economics(row, costs_by_run.get(row.get("run_id")))}
+            for row in result.rows
+        ]
+
+        return {
+            **result.to_dict(),
+            "rows": rows,
+            "filter_options": {
+                "symbols": q.distinct_values(conn, "orders", "symbol"),
+                "sides": q.distinct_values(conn, "orders", "side"),
+                "statuses": q.distinct_values(conn, "orders", "status"),
+            },
+            "sortable": list(q.ORDER_SORTS),
+            "note": (
+                "Fills are simulated by app/paper/broker.py from recorded bar prices "
+                "plus adverse slippage. They are NOT exchange executions: a real "
+                "order may fill at a different price, partially, or not at all. "
+                "Slippage and per-order costs are derived from the run's recorded "
+                "cost assumptions, not separately stored."
+            ),
+        }
+
+    @app.get("/api/export/orders.csv")
+    def export_orders(
+        search: str | None = None,
+        symbol: str | None = None,
+        side: str | None = None,
+        status: str | None = None,
+        run_id: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> StreamingResponse:
+        result = q.query_orders(
+            conn, page=1, page_size=q.MAX_PAGE_SIZE, search=search, symbol=symbol,
+            side=side, status=status, run_id=run_id,
+        )
+        header = [
+            "order_id", "run_id", "signal_id", "trade_id", "symbol", "side",
+            "order_type", "quantity", "status", "filled_price", "filled_quantity",
+            "submitted_at", "filled_at", "rejection_reason",
+        ]
+        rows = [[row.get(k) for k in header] for row in result.rows]
+        return _csv_response("paper_orders.csv", header, rows)
+
+    # ----------------------------------------------------------- positions
+
+    @app.get("/api/positions")
+    def positions(
+        run_id: str | None = None, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        run = _run_scope(conn, run_id)
+        if run is None:
+            return {"has_data": False, "rows": [], "reconciliation": None}
+
+        rid = run["run_id"]
+        rows_raw = q.query_positions(conn, rid)
+        last_snapshot = conn.execute(
+            "SELECT equity, cash FROM equity_snapshots WHERE run_id = ? "
+            "ORDER BY seq DESC LIMIT 1",
+            (rid,),
+        ).fetchone()
+        cash = last_snapshot["cash"] if last_snapshot else None
+        equity = last_snapshot["equity"] if last_snapshot else None
+
+        marked_total = 0.0
+        for row in rows_raw:
+            if row.get("last_price") is not None:
+                marked_total += (row.get("quantity") or 0) * row["last_price"]
+        portfolio_value = (cash + marked_total) if cash is not None else None
+
+        limits = config.risk
+        rows: list[dict[str, Any]] = []
+        for row in rows_raw:
+            marks = position_marks(row, portfolio_value)
+            breaches: list[str] = []
+            if marks["exposure_pct"] is not None and marks["exposure_pct"] > limits.max_position_pct:
+                breaches.append(
+                    f"position is {marks['exposure_pct']:.1%} of portfolio value, "
+                    f"above the {limits.max_position_pct:.0%} max position limit"
+                )
+            if not marks["price_available"]:
+                breaches.append("no current price: unrealised P&L and exposure unknown")
+            holding_days = _holding_days(row.get("opened_at"))
+            rows.append({
+                **row,
+                **marks,
+                "holding_days": holding_days,
+                "breaches": breaches,
+                "last_price_kind": _data_kind(row.get("last_price_source")),
+            })
+
+        exposure_total = sum(
+            r["market_value"] for r in rows if r.get("market_value") is not None
+        )
+        reconciliation = {
+            "cash": cash,
+            "recorded_equity": equity,
+            "marked_positions_value": marked_total if rows else 0.0,
+            "cash_plus_positions": portfolio_value,
+            "difference": (
+                None if (portfolio_value is None or equity is None)
+                else round(portfolio_value - equity, 2)
+            ),
+            "positions_with_missing_price": [
+                r["symbol"] for r in rows if not r["price_available"]
+            ],
+            "note": (
+                "Cash and the marked position value should reconcile to the recorded "
+                "equity. A non-zero difference means a position lacks a price or the "
+                "snapshot and position rows disagree."
+            ),
+        }
+
+        return {
+            "has_data": True,
+            "run": _public_run(run),
+            "rows": rows,
+            "portfolio_value": portfolio_value,
+            "exposure_total": exposure_total,
+            "exposure_pct_of_portfolio": (
+                (exposure_total / portfolio_value) if portfolio_value else None
+            ),
+            "reconciliation": reconciliation,
+            "limits": limits.model_dump(),
+            "note": (
+                "Open positions are a snapshot recorded when the run finished. "
+                "There is no live price feed in this version, so the latest price is "
+                "the last bar the CSV provider supplied."
+            ),
+        }
+
+    # ---------------------------------------------------- strategies / runs
+
+    @app.get("/api/runs")
+    def runs(
+        page: int = 1,
+        page_size: int = q.DEFAULT_PAGE_SIZE,
+        strategy: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        result = q.query_runs(
+            conn, page=page, page_size=page_size, strategy=strategy, sort=sort, order=order
+        )
+        return {
+            **result.to_dict(),
+            "rows": [_public_run(r) for r in result.rows],
+            "sortable": list(q.RUN_SORTS),
+        }
+
+    @app.get("/api/runs/{run_id}")
+    def run_detail(
+        run_id: str, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        run = q.get_run(conn, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        return {
+            "run": _public_run(run),
+            "aggregates": q.run_trade_aggregates(conn, run_id),
+            "max_drawdown_pct": q.max_drawdown(conn, run_id),
+            "equity_curve": q.equity_curve(conn, run_id),
+            "signal_counts": q.signal_action_counts(conn, run_id),
+        }
+
+    @app.get("/api/strategies")
+    def strategies(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+        """Per-strategy summary across recorded runs, plus the strategy
+        parameters currently configured in app/config.py.
+
+        Backtest results and forward paper-trading results are NOT combined:
+        every row here comes from historical backtest runs, which is stated in
+        the response and in the UI.
+        """
+
+        rows = [
+            q.row_to_dict(r) if hasattr(r, "keys") else r
+            for r in conn.execute(
+                """SELECT strategy_name,
+                          COUNT(*) AS backtest_count,
+                          MIN(start_date) AS first_start_date,
+                          MAX(end_date) AS last_end_date,
+                          MAX(started_at) AS last_run_at
+                   FROM runs GROUP BY strategy_name ORDER BY strategy_name"""
+            )
+        ]
+
+        summaries = []
+        for row in rows:
+            name = row["strategy_name"]
+            agg = conn.execute(
+                """SELECT COUNT(*) AS trade_count,
+                          COALESCE(SUM(net_pnl), 0) AS net_pnl,
+                          COALESCE(SUM(gross_pnl), 0) AS gross_pnl,
+                          COALESCE(SUM(costs), 0) AS costs,
+                          SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END) AS win_count,
+                          AVG(CASE WHEN net_pnl > 0 THEN net_pnl END) AS avg_win,
+                          AVG(CASE WHEN net_pnl <= 0 THEN net_pnl END) AS avg_loss
+                   FROM trades WHERE strategy_name = ?""",
+                (name,),
+            ).fetchone()
+            trade_count = agg["trade_count"] or 0
+            win_rate = (agg["win_count"] / trade_count) if trade_count else None
+            summaries.append({
+                **dict(row),
+                "trade_count": trade_count,
+                "net_pnl": agg["net_pnl"],
+                "gross_pnl": agg["gross_pnl"],
+                "costs": agg["costs"],
+                "win_rate": win_rate,
+                "avg_win": agg["avg_win"],
+                "avg_loss": agg["avg_loss"],
+                "expectancy": (
+                    win_rate * (agg["avg_win"] or 0.0) + (1 - win_rate) * (agg["avg_loss"] or 0.0)
+                    if win_rate is not None else None
+                ),
+                "sample_warning": (
+                    "Too few trades for any statistical conclusion."
+                    if trade_count < 30 else
+                    "Small sample; treat all statistics as indicative only."
+                ),
+            })
+
+        return {
+            "rows": summaries,
+            "configured_parameters": {
+                "swing": config.swing.model_dump(),
+                **({"intraday": config.intraday.model_dump()}
+                   if hasattr(config, "intraday") else {}),
+            },
+            "result_kind": "HISTORICAL_BACKTEST",
+            "out_of_sample": {
+                "available": False,
+                "note": (
+                    "No out-of-sample or walk-forward evaluation is recorded in this "
+                    "version. All figures are in-sample backtest results on the same "
+                    "data used to develop the rules, which systematically overstates "
+                    "what to expect."
+                ),
+            },
+            "benchmark_note": (
+                "Where a benchmark appears it is an equal-split buy-and-hold return "
+                "over the same symbols and period, ignoring costs."
+            ),
+            "disclaimer": (
+                "Backtest results are not forward paper-trading results and are not a "
+                "claim of profitability."
+            ),
+        }
+
+    # ---------------------------------------------------------------- risk
+
+    @app.get("/api/risk")
+    def risk(
+        run_id: str | None = None, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        """Configured risk limits, the limits a run actually used, and the
+        exposure/P&L recorded for that run.
+
+        This endpoint is read-only. The dashboard deliberately offers no control
+        that edits risk settings or flips the kill switch: those values are read
+        from app/config.py at process start and are only consulted during a
+        backtest, so a button here would change nothing that is running. Edit
+        app/config.py (or pass CLI options) and re-run instead.
+        """
+
+        run = _run_scope(conn, run_id)
+        limits = config.risk.model_dump()
+
+        current: dict[str, Any] = {
+            "daily_pnl": None, "exposure_value": None, "exposure_pct": None,
+            "open_positions": 0, "available": False,
+        }
+        breaches: list[dict[str, str]] = []
+        run_limits = None
+
+        if run is not None:
+            rid = run["run_id"]
+            run_limits = _json_or(run.get("risk_json"), None)
+            positions = q.query_positions(conn, rid)
+            snapshot = conn.execute(
+                "SELECT equity, cash FROM equity_snapshots WHERE run_id = ? "
+                "ORDER BY seq DESC LIMIT 1",
+                (rid,),
+            ).fetchone()
+            equity = snapshot["equity"] if snapshot else None
+            exposure = sum(
+                (p.get("quantity") or 0) * p["last_price"]
+                for p in positions if p.get("last_price") is not None
+            )
+            agg = q.run_trade_aggregates(conn, rid)
+            current = {
+                "daily_pnl": None,  # not recorded per-day in this version
+                "realized_net_pnl": agg["net_pnl"],
+                "exposure_value": exposure,
+                "exposure_pct": (exposure / equity) if equity else None,
+                "open_positions": len(positions),
+                "equity": equity,
+                "available": True,
+            }
+
+            effective = run_limits or limits
+            if current["exposure_pct"] is not None and current["exposure_pct"] > effective.get(
+                "max_total_exposure_pct", 1
+            ):
+                breaches.append({
+                    "limit": "max_total_exposure_pct",
+                    "detail": (
+                        f"exposure {current['exposure_pct']:.1%} exceeded the configured "
+                        f"{effective['max_total_exposure_pct']:.0%}"
+                    ),
+                })
+            if len(positions) > effective.get("max_open_positions", 10**6):
+                breaches.append({
+                    "limit": "max_open_positions",
+                    "detail": (
+                        f"{len(positions)} open positions exceeded the configured "
+                        f"{effective['max_open_positions']}"
+                    ),
+                })
+
+        rejected = [
+            q.row_to_dict(r)
+            for r in conn.execute(
+                "SELECT symbol, submitted_at, rejection_reason, run_id FROM orders "
+                "WHERE status = 'REJECTED' AND rejection_reason IS NOT NULL "
+                "ORDER BY submitted_at DESC LIMIT 50"
+            )
+        ]
+
+        return {
+            "configured_limits": limits,
+            "limits_used_by_run": run_limits,
+            "limits_source": "app/config.py RiskLimits (process defaults)",
+            "kill_switch": {
+                "enabled": config.risk.kill_switch_enabled,
+                "editable_here": False,
+                "effect": (
+                    "When enabled, app/paper/risk.py refuses every new simulated entry. "
+                    "It never closes an existing position and never deletes history."
+                ),
+                "why_read_only": (
+                    "There is no long-running trading process in this version, so a "
+                    "toggle in the dashboard would not affect anything. Change it in "
+                    "app/config.py and re-run the backtest."
+                ),
+            },
+            "run": _public_run(run) if run else None,
+            "current": current,
+            "breaches": breaches,
+            "risk_rejected_orders": rejected,
+            "sizing_formula": (
+                "quantity = min(cash * risk_per_trade_pct / (entry - stop), "
+                "cash * max_position_pct / entry), floored to whole shares; "
+                "see app/paper/risk.py position_size()."
+            ),
+        }
+
+    # -------------------------------------------------------------- health
+
+    @app.get("/api/health")
+    def health(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+        """Component health. A component that cannot be verified reports
+        UNKNOWN, and a component that does not exist in this version reports
+        NOT_IMPLEMENTED. Neither is ever reported as HEALTHY."""
+
+        components: list[dict[str, Any]] = []
+
+        components.append({
+            "name": "API backend",
+            "status": HEALTHY,
+            "detail": "Serving this request.",
+        })
+
+        try:
+            conn.execute("SELECT COUNT(*) FROM trades").fetchone()
+            integrity = conn.execute("PRAGMA quick_check").fetchone()[0]
+            components.append({
+                "name": "Database (SQLite, read-only)",
+                "status": HEALTHY if integrity == "ok" else DEGRADED,
+                "detail": f"quick_check: {integrity}; file: {ledger_path.name}",
+            })
+        except sqlite3.Error as exc:
+            components.append({
+                "name": "Database (SQLite, read-only)",
+                "status": UNHEALTHY,
+                "detail": str(exc)[:200],
+            })
+
+        csv_files = sorted(data_dir.glob("*.csv")) if data_dir.exists() else []
+        components.append({
+            "name": "Data provider (CSV)",
+            "status": HEALTHY if csv_files else DEGRADED,
+            "detail": (
+                f"{len(csv_files)} CSV file(s) in {data_dir}"
+                if csv_files else f"No CSV files found in {data_dir}"
+            ),
+        })
+
+        last_run = q.latest_run(conn)
+        components.append({
+            "name": "Last backtest run",
+            "status": HEALTHY if last_run else UNKNOWN,
+            "detail": (
+                f"{last_run['strategy_name']} at {last_run['started_at']}"
+                if last_run else "No runs recorded yet."
+            ),
+        })
+
+        # The scanner exists and records an app_event per run, so its health is
+        # derived from whether it has actually run against this ledger rather
+        # than hardcoded.
+        last_scan = None
+        try:
+            last_scan = conn.execute(
+                "SELECT ts, message FROM app_events "
+                "WHERE component = 'scanner' ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            last_scan = None
+        components.append({
+            "name": "Scanner",
+            "status": HEALTHY if last_scan else UNKNOWN,
+            "detail": (
+                f"last scan {last_scan['ts']}: {last_scan['message']}"
+                if last_scan
+                else "Scanner is implemented but has not run against this ledger yet "
+                     "(run: python -m app.cli scan --db <ledger>)."
+            ),
+        })
+
+        # Components the dashboard spec asks about that this version does not
+        # have. Reporting NOT_IMPLEMENTED is the honest answer; reporting
+        # HEALTHY would be a lie, and omitting them would hide the gap.
+        for name, detail in (
+            ("Scheduler", "No scheduled/recurring process exists; scans are run on demand "
+                          "or by an OS scheduler."),
+            ("Alert delivery (Telegram)", "No alerting is implemented in this version."),
+            ("Live/delayed market data feed", "No network data provider exists in this version."),
+        ):
+            components.append({"name": name, "status": NOT_IMPLEMENTED, "detail": detail})
+
+        try:
+            last_write = conn.execute(
+                "SELECT MAX(recorded_at) FROM trades"
+            ).fetchone()[0]
+        except sqlite3.Error:
+            last_write = None
+
+        return {
+            "checked_at_ist": _now_ist().isoformat(),
+            "components": components,
+            "last_successful_db_write": last_write,
+            "events": q.recent_events(conn, limit=200),
+            "event_severities": q.distinct_values(conn, "app_events", "severity"),
+            "log_note": (
+                "Events are rows the application wrote to app_events. An empty list "
+                "means nothing was recorded, NOT that nothing went wrong. This version "
+                "has no rotating file log wired into the dashboard."
+            ),
+        }
+
+    @app.get("/api/events")
+    def events(
+        limit: int = Query(default=200, ge=1, le=1000),
+        severity: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        return {"rows": q.recent_events(conn, limit=limit, severity=severity)}
+
+    # ------------------------------------------------------------ explorer
+
+    @app.get("/api/db/tables")
+    def db_tables(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+        tables = []
+        for name in EXPLORABLE_TABLES:
+            try:
+                count = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+                columns = q.table_columns(conn, name)
+                tables.append({
+                    "name": name, "row_count": count, "column_count": len(columns),
+                })
+            except (sqlite3.Error, q.InvalidQuery):
+                tables.append({"name": name, "row_count": None, "column_count": None,
+                               "error": "table not present in this database"})
+
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+        return {
+            "tables": tables,
+            "database": {
+                # The configured path is shown so you know which ledger you are
+                # reading. No credentials or environment values are exposed —
+                # this app has no database credentials at all.
+                "path": str(ledger_path),
+                "size_bytes": page_size * page_count,
+                "journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
+                "access": "read-only (SQLite mode=ro)",
+                "last_write_at": conn.execute(
+                    "SELECT MAX(recorded_at) FROM trades"
+                ).fetchone()[0],
+            },
+            "capabilities": {
+                "read": True, "write": False, "delete": False, "raw_sql": False,
+                "note": (
+                    "This explorer can only read allowlisted tables through "
+                    "parameterized queries. It cannot edit or delete rows and does "
+                    "not accept SQL."
+                ),
+            },
+        }
+
+    @app.get("/api/db/tables/{table}")
+    def db_browse(
+        table: str,
+        page: int = 1,
+        page_size: int = q.DEFAULT_PAGE_SIZE,
+        search: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        symbol: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        return q.browse_table(
+            conn, table, page=page, page_size=page_size, search=search, sort=sort,
+            order=order, date_from=date_from, date_to=date_to, symbol=symbol,
+        )
+
+    @app.get("/api/db/latest")
+    def db_latest(
+        limit: int = Query(default=10, ge=1, le=100),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        return {"latest": q.latest_rows(conn, limit=limit)}
+
+    @app.get("/api/db/export/{table}.csv")
+    def db_export(
+        table: str,
+        search: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        symbol: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> StreamingResponse:
+        result = q.browse_table(
+            conn, table, page=1, page_size=q.MAX_PAGE_SIZE, search=search, sort=sort,
+            order=order, date_from=date_from, date_to=date_to, symbol=symbol,
+        )
+        header = [c["name"] for c in result["columns"]]
+        rows = [[row.get(k) for k in header] for row in result["rows"]]
+        return _csv_response(f"{table}.csv", header, rows)
+
+    # --------------------------------------------------------- market data
+
+    @app.get("/api/marketdata/watchlist")
+    def watchlist() -> dict[str, Any]:
+        """The configured watchlist is simply the CSV files available to the
+        provider. There is no scanner in this version, so nothing is polled."""
+
+        if not data_dir.exists():
+            return {
+                "rows": [], "directory": str(data_dir), "directory_exists": False,
+                "error": "The configured data directory does not exist.",
+            }
+
+        rows = []
+        for path in sorted(data_dir.glob("*.csv")):
+            stat = path.stat()
+            rows.append({
+                "symbol": path.stem.upper(),
+                "file": path.name,
+                "size_bytes": stat.st_size,
+                "file_modified_ist": datetime.fromtimestamp(stat.st_mtime, tz=IST).isoformat(),
+                "data_kind": _data_kind(None, path.name),
+            })
+        return {
+            "rows": rows,
+            "directory": str(data_dir),
+            "directory_exists": True,
+            "provider": "CsvProvider",
+            "streaming": False,
+            "note": (
+                "File-based provider. Data is read on request; nothing is streamed, "
+                "polled, or delayed-quoted. Freshness is the freshness of the file."
+            ),
+        }
+
+    @app.get("/api/marketdata/bars/{symbol}")
+    def bars(
+        symbol: str,
+        interval: str = "1d",
+        limit: int = Query(default=200, ge=1, le=2000),
+    ) -> dict[str, Any]:
+        """Validated bars for one symbol, with the data-quality flags the
+        validator produced. Returns a structured error rather than a 500 when a
+        file is missing or malformed."""
+
+        from app.data.csv_provider import CsvProvider
+
+        provider = CsvProvider(data_dir)
+        try:
+            series = provider.get_bars(symbol, interval=interval)
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=404, detail=f"No CSV data found for symbol {symbol!r}"
+            )
+        except ValueError as exc:
+            # Malformed CSV: surface the validator's own message, which names the
+            # file and row, without a stack trace.
+            return {
+                "symbol": symbol.upper(), "rows": [], "error": str(exc)[:300],
+                "provider_status": "ERROR",
+            }
+
+        if not series:
+            return {
+                "symbol": symbol.upper(), "rows": [], "provider_status": "EMPTY",
+                "error": "The file contained no bars in the requested range.",
+            }
+
+        tail = series[-limit:]
+        quality_counts: dict[str, int] = {}
+        issues: list[dict[str, Any]] = []
+        for bar in series:
+            quality_counts[bar.quality.value] = quality_counts.get(bar.quality.value, 0) + 1
+            if bar.quality_notes:
+                issues.append({
+                    "timestamp": bar.timestamp.isoformat(),
+                    "quality": bar.quality.value,
+                    "notes": list(bar.quality_notes),
+                })
+
+        latest = series[-1]
+        return {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "provider_status": "OK",
+            "source": latest.source,
+            "data_kind": _data_kind(latest.source),
+            "retrieved_at": latest.retrieved_at.isoformat(),
+            "bar_count": len(series),
+            "first_timestamp": series[0].timestamp.isoformat(),
+            "latest_timestamp": latest.timestamp.isoformat(),
+            "latest_bar": {
+                "timestamp": latest.timestamp.isoformat(),
+                "open": latest.open, "high": latest.high, "low": latest.low,
+                "close": latest.close, "volume": latest.volume,
+                "quality": latest.quality.value,
+                "quality_notes": list(latest.quality_notes),
+            },
+            "quality_counts": quality_counts,
+            "issues": issues[:200],
+            "issue_count": len(issues),
+            "rows": [
+                {
+                    "timestamp": b.timestamp.isoformat(), "open": b.open, "high": b.high,
+                    "low": b.low, "close": b.close, "volume": b.volume,
+                    "quality": b.quality.value,
+                }
+                for b in tail
+            ],
+            "note": (
+                "Historical bars from a CSV file, validated at read time. Not a live "
+                "or delayed feed. A SAMPLE_SYNTHETIC data_kind means the bars were "
+                "generated for testing and describe no real company."
+            ),
+        }
+
+    # ----------------------------------------------------------- UI shell
+
+    if STATIC_DIR.exists():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> HTMLResponse:
+        page = STATIC_DIR / "index.html"
+        if not page.exists():
+            return HTMLResponse(
+                "<h1>PAPER TRADING — NO REAL ORDERS</h1>"
+                "<p>Dashboard assets are missing. The JSON API is available at "
+                "<a href='/api/docs'>/api/docs</a>.</p>",
+                status_code=200,
+            )
+        return HTMLResponse(page.read_text(encoding="utf-8"))
+
+    return app
+
+
+# --------------------------------------------------------------- helpers
+
+
+def _public_run(run: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Shapes a `runs` row for the API, parsing its JSON blobs. Nothing is
+    hidden here; the blobs are expanded so the UI does not have to parse them."""
+
+    if run is None:
+        return None
+    out = dict(run)
+    out["symbols"] = _json_or(run.get("symbols"), [])
+    out["metrics"] = _json_or(run.get("metrics_json"), {})
+    out["data_sources"] = _json_or(run.get("data_source_json"), {})
+    out["params"] = _json_or(run.get("params_json"), {})
+    out["costs"] = _json_or(run.get("costs_json"), {})
+    out["risk"] = _json_or(run.get("risk_json"), {})
+    out["reconciliation_problems"] = _json_or(run.get("reconciliation_json"), [])
+    for key in (
+        "symbols_json", "metrics_json", "data_source_json", "params_json",
+        "costs_json", "risk_json", "reconciliation_json",
+    ):
+        out.pop(key, None)
+    return out
+
+
+def _with_parsed_inputs(signal: dict[str, Any]) -> dict[str, Any]:
+    out = dict(signal)
+    out["inputs"] = _json_or(signal.get("inputs_json"), {})
+    out.pop("inputs_json", None)
+    return out
+
+
+def _json_or(raw: Any, fallback: Any) -> Any:
+    if raw in (None, ""):
+        return fallback
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _holding_days(opened_at: str | None) -> int | None:
+    if not opened_at:
+        return None
+    try:
+        opened = datetime.fromisoformat(opened_at)
+    except ValueError:
+        return None
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=IST)
+    return max(0, (_now_ist() - opened).days)
