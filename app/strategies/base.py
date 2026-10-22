@@ -16,6 +16,15 @@ from app.models import Bar, Signal
 class Strategy(ABC):
     name: str
 
+    @property
+    def required_history(self) -> int:
+        """Minimum number of bars this strategy needs before it can emit any
+        actionable signal. Evaluation code uses this to tell "the strategy
+        found no setup" apart from "the window was too short to warm up the
+        indicators" — two very different findings that look identical if you
+        only count trades."""
+        return 2
+
     @abstractmethod
     def evaluate(self, bars: list[Bar]) -> Signal:
         """`bars` must be time-ordered, all with timestamp <= decision time,

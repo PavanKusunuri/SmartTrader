@@ -88,6 +88,7 @@ class Portfolio:
         timestamp: datetime,
         exit_reason: str,
         exit_order_id: str,
+        ambiguous_exit: bool = False,
     ) -> Trade:
         if symbol not in self.positions:
             raise ValueError(f"no open position in {symbol} to sell")
@@ -114,6 +115,7 @@ class Portfolio:
             costs=round(total_costs, 2),
             net_pnl=round(net_pnl, 2),
             exit_reason=exit_reason,
+            ambiguous_exit=ambiguous_exit,
         )
         self.trades.append(trade)
         return trade

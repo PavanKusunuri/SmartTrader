@@ -8,6 +8,7 @@ current bar's price plus configured slippage/costs.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from app.backtest.costs import compute_order_costs, compute_slippage
 from app.config import AppConfig
@@ -31,18 +32,28 @@ class PaperBroker:
         signal: Signal,
         fill_price_basis: float,
         current_prices: dict[str, float],
+        fill_timestamp: datetime | None = None,
+        ambiguous_exit: bool = False,
     ) -> Order | None:
         """Turns a Signal into a simulated Order, or returns None for
         NO_TRADE signals (no order is created at all — there is nothing to
         reject or fill).
 
-        `fill_price_basis` is the price the fill is simulated from (this
-        milestone uses the signal bar's close; see app/backtest/engine.py
-        for why that choice is explicit and documented rather than implicit).
+        `fill_price_basis` is the price the fill is simulated from, decided
+        by the caller. The backtest engine passes the NEXT bar's open, so a
+        decision made on bar N never fills at bar N's own close.
+        `fill_timestamp` is when the fill happened (defaults to the signal's
+        own timestamp when the caller does not separate the two).
+
+        Risk limits are re-checked here, at fill time, not at signal time —
+        so a queued order that has become unaffordable or would breach a
+        limit is rejected rather than filled on stale reasoning.
         """
 
         if signal.action == SignalAction.NO_TRADE:
             return None
+
+        fill_timestamp = fill_timestamp or signal.timestamp
 
         if signal.signal_id in self._processed_signal_ids:
             return self._make_order(
@@ -52,14 +63,18 @@ class PaperBroker:
         self._processed_signal_ids.add(signal.signal_id)
 
         if signal.action == SignalAction.BUY:
-            return self._process_buy(signal, fill_price_basis, current_prices)
+            return self._process_buy(signal, fill_price_basis, current_prices, fill_timestamp)
         if signal.action == SignalAction.SELL:
-            return self._process_sell(signal, fill_price_basis)
+            return self._process_sell(signal, fill_price_basis, fill_timestamp, ambiguous_exit)
 
         raise ValueError(f"unhandled signal action: {signal.action}")
 
     def _process_buy(
-        self, signal: Signal, fill_price_basis: float, current_prices: dict[str, float]
+        self,
+        signal: Signal,
+        fill_price_basis: float,
+        current_prices: dict[str, float],
+        fill_timestamp: datetime,
     ) -> Order:
         if signal.stop_loss is None:
             return self._make_order(
@@ -88,7 +103,7 @@ class PaperBroker:
                 quantity=quantity,
                 fill_price=fill_price,
                 costs=costs,
-                timestamp=signal.timestamp,
+                timestamp=fill_timestamp,
                 stop_loss=signal.stop_loss,
                 target=signal.target,
                 order_id=order.order_id,
@@ -101,10 +116,16 @@ class PaperBroker:
         order.status = OrderStatus.FILLED
         order.filled_price = fill_price
         order.filled_quantity = quantity
-        order.filled_at = signal.timestamp
+        order.filled_at = fill_timestamp
         return order
 
-    def _process_sell(self, signal: Signal, fill_price_basis: float) -> Order:
+    def _process_sell(
+        self,
+        signal: Signal,
+        fill_price_basis: float,
+        fill_timestamp: datetime,
+        ambiguous_exit: bool = False,
+    ) -> Order:
         if signal.symbol not in self.portfolio.positions:
             return self._make_order(
                 signal, quantity=0, status=OrderStatus.REJECTED,
@@ -120,16 +141,26 @@ class PaperBroker:
             symbol=signal.symbol,
             fill_price=fill_price,
             costs=costs,
-            timestamp=signal.timestamp,
+            timestamp=fill_timestamp,
             exit_reason=signal.reason,
             exit_order_id=order.order_id,
+            ambiguous_exit=ambiguous_exit,
         )
 
         order.status = OrderStatus.FILLED
         order.filled_price = fill_price
         order.filled_quantity = position.quantity
-        order.filled_at = signal.timestamp
+        order.filled_at = fill_timestamp
         return order
+
+    def record_expired_order(self, signal: Signal, reason: str) -> Order:
+        """Records a signal that could never be filled (e.g. no next bar to
+        fill against, or the fill bar's data was invalid) as a cancelled
+        order, so it shows up in the audit trail instead of vanishing."""
+
+        return self._make_order(
+            signal, quantity=0, status=OrderStatus.CANCELLED, rejection_reason=reason
+        )
 
     def _make_order(
         self,

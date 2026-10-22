@@ -58,6 +58,32 @@ class SwingStrategyConfig(BaseModel):
         return v
 
 
+class IntradayStrategyConfig(BaseModel):
+    """Parameters for the Milestone-2 intraday prototype.
+
+    EXPERIMENTAL defaults, not a profitability claim. Intraday trading has
+    materially higher cost and slippage sensitivity than swing trading; see
+    docs/RISK_AND_LIMITATIONS.md.
+    """
+
+    fast_ma_period: int = Field(default=9, ge=2)
+    slow_ma_period: int = Field(default=21, ge=2)
+    volume_ma_period: int = Field(default=20, ge=2)
+    # Entry requires current volume above this multiple of recent average
+    # volume, as a crude "is anyone actually trading this move" filter.
+    volume_surge_multiple: float = Field(default=1.5, gt=0)
+    stop_loss_pct: float = Field(default=0.01, gt=0, le=1)
+    target_pct: float = Field(default=0.02, gt=0, le=1)
+
+    @field_validator("slow_ma_period")
+    @classmethod
+    def slow_must_exceed_fast(cls, v: int, info) -> int:
+        fast = info.data.get("fast_ma_period")
+        if fast is not None and v <= fast:
+            raise ValueError("slow_ma_period must be greater than fast_ma_period")
+        return v
+
+
 class AppConfig(BaseModel):
     """Top-level configuration. Construct via AppConfig() for defaults, or
     AppConfig.model_validate(dict_from_file) for loaded config."""
@@ -68,6 +94,7 @@ class AppConfig(BaseModel):
     costs: CostAssumptions = Field(default_factory=CostAssumptions)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     swing: SwingStrategyConfig = Field(default_factory=SwingStrategyConfig)
+    intraday: IntradayStrategyConfig = Field(default_factory=IntradayStrategyConfig)
 
     @field_validator("timezone")
     @classmethod

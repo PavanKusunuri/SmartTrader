@@ -6,25 +6,37 @@
 > Simulated fills do not guarantee real-world fills or prices. Nothing here
 > is investment advice or a claim of profitability.
 
-## What works today (Milestone 1)
+## What works today (Milestones 1–2)
 
-- Loads daily OHLCV bars from CSV files (bundled synthetic samples + your own files).
-- Validates data: timezone-aware IST timestamps, OHLC consistency, zero/negative
-  prices, duplicate/out-of-order bars, abnormal gaps, staleness.
-- One experimental swing strategy (moving-average trend filter) that returns
-  `NO_TRADE` when data is bad, history is short, or no setup exists.
-- Causally-correct backtest: a decision for a given day uses only bars dated
-  on or before that day.
-- Virtual broker with position sizing, risk limits, kill switch, slippage and
+- Loads daily and intraday OHLCV bars from CSV files (bundled synthetic
+  samples + your own files).
+- Validates data: timezone-aware IST timestamps, OHLC consistency,
+  zero/negative prices, duplicate/out-of-order bars, abnormal gaps, staleness.
+- **Two** experimental strategies, both returning `NO_TRADE` with a reason
+  when data is bad, history is short, or no setup exists:
+  - swing (daily): moving-average trend filter
+  - intraday: MA trend filter + momentum + volume confirmation + session rules
+- Causally-correct backtest: decisions use only bars at or before the decision
+  time, and **signals fill at the next bar's open**, never at the close that
+  produced them.
+- Stop-loss/target enforced intrabar. If both are hit in one bar, the engine
+  assumes the **stop** filled first and flags the trade as ambiguous.
+- Configurable market session: entry cutoff and forced end-of-day flattening
+  (no overnight intraday positions). Holiday list is user-supplied.
+- Virtual broker with position sizing, risk limits, kill switch, slippage,
   configurable cost assumptions, and duplicate-signal protection.
+- Out-of-sample and segmented multi-period evaluation that tells you when a
+  window was too short to warm up indicators instead of printing misleading
+  zeros.
+- Honest strategy comparison that **refuses to name a winner** on thin
+  evidence.
 - SQLite ledger that survives restarts, plus CSV export of closed trades.
-- 69 passing tests.
+- 119 passing tests.
 
 ## Not built yet
 
-Intraday strategy, scanner/watchlist scheduling, Streamlit dashboard,
-Telegram alerts, live data providers, cloud deployment. See `CLAUDE.md`
-for the milestone plan.
+Scanner/watchlist scheduling, Telegram alerts, live data providers, cloud
+deployment. See `CLAUDE.md` for the milestone plan.
 
 ## Quick start (Windows PowerShell)
 
@@ -46,10 +58,21 @@ python -m pytest tests\ -v
 # 5. Regenerate sample data (optional — it is already committed)
 python scripts\generate_sample_data.py
 
-# 6. Run a backtest end-to-end
+# 6. Run a swing backtest end-to-end
 python -m app.cli backtest --symbols SAMPLE_TCS,SAMPLE_INFY
 
-# 7. Run with a persistent ledger and a CSV export
+# 7. Run the intraday strategy (adds session rules + EOD flattening)
+python -m app.cli backtest --strategy intraday --interval 5m `
+    --symbols SAMPLE_INTRADAY_TCS
+
+# 8. Evaluate across time periods instead of one headline number
+python -m app.cli evaluate --symbols SAMPLE_TCS --mode oos
+python -m app.cli evaluate --symbols SAMPLE_TCS --mode segmented --windows 2
+
+# 9. Compare the two strategies (it will refuse to rank thin evidence)
+python -m app.cli compare
+
+# 10. Run with a persistent ledger and a CSV export
 python -m app.cli backtest --symbols SAMPLE_TCS,SAMPLE_INFY `
     --db data\paper_trading.db --export-csv data\exports\trades.csv
 ```

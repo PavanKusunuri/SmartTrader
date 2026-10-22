@@ -118,3 +118,8 @@ class Trade:
     costs: float
     net_pnl: float
     exit_reason: str
+    # True when stop-loss and target were both touched inside the same bar,
+    # so the real order of events is unknowable from OHLC data alone. The
+    # engine assumes the stop filled first (conservative), but the outcome
+    # is marked here so these trades can be excluded or scrutinised.
+    ambiguous_exit: bool = False

@@ -33,6 +33,10 @@ class SwingMAStrategy(Strategy):
     def __init__(self, config: SwingStrategyConfig | None = None):
         self.config = config or SwingStrategyConfig()
 
+    @property
+    def required_history(self) -> int:
+        return self.config.slow_ma_period + 1
+
     def _signal_id(self, bar: Bar) -> str:
         return f"{self.name}:{bar.symbol}:{bar.timestamp.isoformat()}"
 
