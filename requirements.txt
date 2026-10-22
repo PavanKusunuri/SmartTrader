@@ -1,0 +1,7 @@
+# Pinned to versions confirmed to have prebuilt wheels for Python 3.14 on
+# Windows (see docs/BUILD_LOG.md, Milestone 0). Re-verify before bumping.
+pandas==3.1.0
+numpy==2.5.4
+pydantic==2.14.1
+pytest==9.1.1
+python-dotenv==1.2.4
