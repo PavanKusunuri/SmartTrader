@@ -219,6 +219,40 @@ class SwingStrategyConfig(BaseModel):
         return v
 
 
+class SwingTrendConfig(BaseModel):
+    """Parameters for the regime-gated, ATR-scaled swing trend strategy.
+
+    EXPERIMENTAL, untuned defaults. No out-of-sample evidence exists yet that
+    this beats the MA-crossover prototype or buy-and-hold; see
+    docs/STRATEGIES.md.
+    """
+
+    trend_fast_ma: int = Field(default=20, ge=2)
+    trend_slow_ma: int = Field(default=50, ge=3)
+    breakout_lookback: int = Field(default=20, ge=2)
+    breakout_volume_multiple: float = Field(default=1.5, gt=0)
+    pullback_atr_band: float = Field(default=1.0, gt=0)
+    atr_period: int = Field(default=14, ge=2)
+    # Stop distance in ATRs. Position size is risk-budget / stop distance, so
+    # a volatile stock automatically gets fewer shares.
+    stop_atr_multiple: float = Field(default=2.0, gt=0)
+    target_rr: float = Field(default=2.0, gt=0)
+    max_extension_atr: float = Field(default=1.5, gt=0)
+    # Exit when the close falls below this MA (trend failure), or on time stop.
+    exit_ma: int = Field(default=20, ge=2)
+    max_holding_days: int = Field(default=30, ge=1)
+    # Require a bullish index regime when index bars are supplied.
+    use_regime_filter: bool = Field(default=True)
+
+    @field_validator("trend_slow_ma")
+    @classmethod
+    def slow_must_exceed_fast(cls, v: int, info) -> int:
+        fast = info.data.get("trend_fast_ma")
+        if fast is not None and v <= fast:
+            raise ValueError("trend_slow_ma must be greater than trend_fast_ma")
+        return v
+
+
 class IntradayStrategyConfig(BaseModel):
     """Parameters for the Milestone-2 intraday prototype.
 
@@ -256,6 +290,7 @@ class AppConfig(BaseModel):
     viability: ViabilityPolicy = Field(default_factory=ViabilityPolicy)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     swing: SwingStrategyConfig = Field(default_factory=SwingStrategyConfig)
+    swing_trend: SwingTrendConfig = Field(default_factory=SwingTrendConfig)
     intraday: IntradayStrategyConfig = Field(default_factory=IntradayStrategyConfig)
 
     @field_validator("timezone")

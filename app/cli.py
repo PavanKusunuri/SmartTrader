@@ -35,6 +35,7 @@ from app.storage.scanner_state import ScannerStateStore
 from app.storage.sqlite import RESET_CONFIRMATION_TOKEN, SqliteRepository
 from app.strategies.intraday import IntradayMomentumStrategy
 from app.strategies.swing import SwingMAStrategy
+from app.strategies.swing_trend import SwingTrendStrategy
 
 BANNER = "=" * 64 + "\n  PAPER TRADING — NO REAL ORDERS (simulated fills only)\n" + "=" * 64
 
@@ -68,12 +69,29 @@ def _strategy_factory(args: argparse.Namespace, config: AppConfig):
     if getattr(args, "strategy", "swing") == "intraday":
         session = _build_session(args)
         return lambda: IntradayMomentumStrategy(config.intraday, session=session)
+    if getattr(args, "strategy", "swing") == "swing_atr":
+        index_bars = _load_index_bars(args)
+        return lambda: SwingTrendStrategy(config.swing_trend, index_bars=index_bars)
     return lambda: SwingMAStrategy(config.swing)
+
+
+def _load_index_bars(args: argparse.Namespace):
+    """Index/ETF bars for the regime gate, or None (gate then reports
+    NOT_CHECKED in every signal rather than silently passing)."""
+
+    symbol = getattr(args, "index_symbol", None)
+    if not symbol:
+        return None
+    return CsvProvider(args.data_dir).get_bars(
+        symbol.strip().upper(), interval=getattr(args, "interval", "1d"),
+    )
 
 
 def _strategy_params(args: argparse.Namespace, config: AppConfig) -> dict:
     if getattr(args, "strategy", "swing") == "intraday":
         return config.intraday.model_dump()
+    if getattr(args, "strategy", "swing") == "swing_atr":
+        return config.swing_trend.model_dump()
     return config.swing.model_dump()
 
 
@@ -238,6 +256,12 @@ def cmd_compare(args: argparse.Namespace) -> int:
         strategy = SwingMAStrategy(config.swing)
         results[strategy.name] = run_backtest(
             provider=provider, symbols=syms, strategy=strategy, config=config,
+            interval="1d", session=None,
+        )
+
+        trend = SwingTrendStrategy(config.swing_trend)  # no index: regime gate skipped
+        results[trend.name] = run_backtest(
+            provider=provider, symbols=syms, strategy=trend, config=config,
             interval="1d", session=None,
         )
 
@@ -660,9 +684,15 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--end", default=None, help="YYYY-MM-DD inclusive")
         p.add_argument("--starting-cash", type=float, default=None)
         p.add_argument(
-            "--strategy", choices=["swing", "intraday"], default="swing",
-            help="swing = daily bars, held across days; intraday = session rules "
-                 "(entry cutoff) plus forced end-of-day flattening",
+            "--strategy", choices=["swing", "intraday", "swing_atr"], default="swing",
+            help="swing = MA crossover on daily bars; swing_atr = regime-gated "
+                 "breakout/pullback with ATR stops (daily bars); intraday = session "
+                 "rules (entry cutoff) plus forced end-of-day flattening",
+        )
+        p.add_argument(
+            "--index-symbol", default=None,
+            help="CSV symbol of an index/ETF series (e.g. NIFTYBEES) for the "
+                 "swing_atr regime gate. Omit to skip the gate (stated in signals).",
         )
         p.add_argument("--interval", default="1d", help="bar interval label, e.g. 1d or 5m")
         p.add_argument(

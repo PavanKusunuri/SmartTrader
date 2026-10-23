@@ -776,3 +776,16 @@ Full suite: see run below.
   and a calculator panel on the dashboard Risk page. It changes no setting; profiles are not advice.
 - `tests/test_risk_budget.py`: 6 tests. Full suite: 419 passed. The dashboard JS was syntax-checked
   with `node --check` but not exercised in a browser.
+
+## 2026-10-23 — Swing trend strategy (regime-gated, ATR-scaled)
+
+- `app/strategies/swing_trend.py` (`--strategy swing_atr`, optional `--index-symbol`): index regime gate ->
+  stock uptrend filter -> volume-confirmed breakout or MA pullback (shared with `app/selection/ranking.py`)
+  -> ATR stop and R-multiple target; exits on close below MA20 or a time stop. `SwingTrendConfig` in config.
+- Also added to `compare`. `tests/test_swing_trend.py`: 10 tests including an engine-level future-bar
+  causality test. Full suite: 429 passed.
+- Result on SYNTHETIC samples (noise, not evidence): swing_trend_atr 16 trades, 19% win rate, net -1.53%,
+  gross +0.09%, costs Rs 1,616; the MA crossover scored +2.61% on 3 trades. Neither sample is meaningful.
+  Parameters were NOT tuned to these numbers.
+- Not done: only one real trading day is imported, so no real or out-of-sample evaluation was possible;
+  trailing stops, shorting, news/event filters and market breadth are absent.
