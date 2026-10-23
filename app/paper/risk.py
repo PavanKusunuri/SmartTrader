@@ -83,4 +83,11 @@ class RiskManager:
                 f"max daily loss reached: daily P&L {daily_pnl:.2f} <= limit {max_loss:.2f}"
             )
 
+        weekly_loss = -self.limits.max_weekly_loss_pct * portfolio.week_start_equity
+        if portfolio.weekly_pnl(current_prices) <= weekly_loss:
+            return False, (
+                f"max weekly loss reached: weekly P&L {portfolio.weekly_pnl(current_prices):.2f} "
+                f"<= limit {weekly_loss:.2f}"
+            )
+
         return True, ""

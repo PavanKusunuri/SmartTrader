@@ -40,3 +40,8 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Imported NSE data (raw downloads, normalized output, manifests)
+data/raw/
+data/processed/
+data/manifests/

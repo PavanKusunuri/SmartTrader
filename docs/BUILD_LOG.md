@@ -754,3 +754,16 @@ Limits: a gap can still exceed the buffer (overnight news); the stop cannot be
 guaranteed. Sizing uses cash, not equity. Drawdown peak is held in memory and
 resets on process restart (not persisted). Defaults are judgement calls.
 Full suite: see run below.
+
+## 2026-10-23 — Daily-data import, volume analytics, universe report
+
+- `app/data/ingest.py` + `import-bhavcopy` CLI: manual CSV/ZIP import to raw/processed/manifests.
+  No automatic NSE download: the existing project policy forbids bypassing NSE access controls and
+  I did not verify that NSE terms permit automation, so none was written.
+- `app/selection/volume.py`: avg/relative volume, spike, breakout+volume, traded value, zero-volume
+  runs, `evaluate_universe` (explains every symbol); `universe` CLI saves a CSV.
+- Swing volume filter (off by default) + `compare --volume-variant`; `max_weekly_loss_pct`.
+- `tests/test_ingest_and_volume.py`: 13 tests. Full suite: 409 passed.
+- Not done: the dashboard capital panel was not changed, universe scans are saved as CSV not SQLite,
+  news/events and surveillance flags have no data source, volume-vs-price-only comparison on real
+  data awaits imported files (only synthetic samples were run).

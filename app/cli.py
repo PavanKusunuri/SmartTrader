@@ -241,6 +241,13 @@ def cmd_compare(args: argparse.Namespace) -> int:
             interval="1d", session=None,
         )
 
+        if getattr(args, "volume_variant", False):
+            vcfg = config.swing.model_copy(update={"volume_filter_enabled": True})
+            results[strategy.name + "+volume"] = run_backtest(
+                provider=provider, symbols=syms, strategy=SwingMAStrategy(vcfg),
+                config=config, interval="1d", session=None,
+            )
+
     if args.intraday_symbols:
         syms = [s.strip().upper() for s in args.intraday_symbols.split(",") if s.strip()]
         session = MarketSession()
@@ -470,6 +477,72 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_bhavcopy(args: argparse.Namespace) -> int:
+    """Import manually downloaded NSE UDiFF files (DAILY data) into
+    raw/processed/manifests. No network access."""
+
+    from app.data.ingest import import_bhavcopy_files
+
+    print(BANNER)
+    session = MarketSession(holidays=load_holidays(args.holidays)) if args.holidays else MarketSession()
+    fmt = lambda v: datetime.strptime(v, "%Y-%m-%d").date() if v else None  # noqa: E731
+    symbols = [s for s in (args.symbols or "").split(",") if s.strip()] or None
+    report = import_bhavcopy_files(
+        [Path(p) for p in args.inputs],
+        raw_dir=Path(args.data_root) / "raw",
+        processed_dir=Path(args.data_root) / "processed",
+        manifest_dir=Path(args.data_root) / "manifests",
+        start=fmt(args.start), end=fmt(args.end), symbols=symbols, session=session,
+        progress=print,
+    )
+    print("\n" + report.summary())
+    print(DISCLAIMER)
+    return 0 if report.files_ok and not report.files_failed else 1
+
+
+def cmd_universe(args: argparse.Namespace) -> int:
+    """Eligibility scan over a folder of DAILY per-symbol CSVs; explains every
+    include/exclude and saves the result."""
+
+    from app.selection.volume import UniverseCriteria, evaluate_universe
+
+    print(BANNER)
+    d = Path(args.data_dir)
+    provider = CsvProvider(d)
+    universe: dict = {}
+    for f in sorted(d.glob("*.csv")):
+        sym = f.stem.upper()
+        try:
+            universe[sym] = provider.get_bars(sym)
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"  {sym}: unreadable ({exc})")
+            universe[sym] = []
+    now = datetime.now(tz=ZoneInfo("Asia/Kolkata"))
+    as_of = max((b[-1].timestamp.date() for b in universe.values() if b), default=now.date())
+    if args.as_of:
+        as_of = datetime.strptime(args.as_of, "%Y-%m-%d").date()
+    rows = evaluate_universe(universe, as_of, now.isoformat(), UniverseCriteria(
+        min_price=args.min_price, min_avg_volume=args.min_avg_volume,
+        min_avg_traded_value=args.min_traded_value, min_history_bars=args.min_bars))
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["scan_ts", "symbol", "exchange", "eligible", "reasons", "flags",
+                    "latest_data_ts", "price", "volume", "avg_traded_value", "relative_volume"])
+        for r in rows:
+            w.writerow([r.scan_ts, r.symbol, r.exchange, r.eligible, " | ".join(r.reasons),
+                        " | ".join(r.flags), r.latest_data_ts, r.price, r.volume,
+                        r.avg_traded_value, r.relative_volume])
+    for r in rows:
+        print(f"{'INCLUDED' if r.eligible else 'EXCLUDED'} {r.symbol}: {'; '.join(r.reasons)}")
+        for fl in r.flags:
+            print(f"    flag: {fl}")
+    print(f"\nSaved {len(rows)} rows to {out}   (DAILY data; thresholds are configurable assumptions)")
+    print(DISCLAIMER)
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Starts the read-only local dashboard."""
 
@@ -575,6 +648,8 @@ def main(argv: list[str] | None = None) -> int:
     cm.add_argument("--swing-symbols", default="SAMPLE_TCS,SAMPLE_INFY")
     cm.add_argument("--intraday-symbols", default="SAMPLE_INTRADAY_TCS")
     cm.add_argument("--intraday-interval", default="5m")
+    cm.add_argument("--volume-variant", action="store_true",
+                    help="also run swing with the relative-volume entry filter, same data/capital")
     cm.add_argument("--data-dir", default=str(DEFAULT_SAMPLES_DIR))
     cm.add_argument("--starting-cash", type=float, default=None)
     cm.set_defaults(func=cmd_compare)
@@ -626,6 +701,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     sv.add_argument("--port", type=int, default=8000)
     sv.set_defaults(func=cmd_serve)
+
+    ib = sub.add_parser(
+        "import-bhavcopy",
+        help="Import hand-downloaded NSE UDiFF bhavcopy .csv/.zip files (DAILY data)",
+    )
+    ib.add_argument("inputs", nargs="+", help="files and/or folders of .csv/.zip")
+    ib.add_argument("--data-root", default="data", help="holds raw/, processed/, manifests/")
+    ib.add_argument("--start", default=None, help="YYYY-MM-DD")
+    ib.add_argument("--end", default=None, help="YYYY-MM-DD")
+    ib.add_argument("--symbols", default=None, help="comma list; default = all EQ symbols")
+    ib.add_argument("--holidays", default=None, help="CSV with a 'date' column")
+    ib.set_defaults(func=cmd_import_bhavcopy)
+
+    un = sub.add_parser("universe", help="Explain which symbols are eligible (daily CSVs)")
+    un.add_argument("--data-dir", default="data/processed")
+    un.add_argument("--output", default="data/exports/universe_scan.csv")
+    un.add_argument("--as-of", default=None)
+    un.add_argument("--min-price", type=float, default=20.0)
+    un.add_argument("--min-avg-volume", type=float, default=100_000)
+    un.add_argument("--min-traded-value", type=float, default=2e7)
+    un.add_argument("--min-bars", type=int, default=60)
+    un.set_defaults(func=cmd_universe)
 
     args = parser.parse_args(argv)
     return args.func(args)

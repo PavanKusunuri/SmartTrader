@@ -29,6 +29,10 @@ class Portfolio:
         self.realized_pnl_carried_forward: float = 0.0
         self._current_day: date | None = None
         self._day_start_equity: float = starting_cash
+        # Weekly loss baseline. In-memory only (not persisted): resets on
+        # process restart, like the drawdown peak. Documented limitation.
+        self._week_key: tuple[int, int] | None = None
+        self._week_start_equity: float = starting_cash
 
     def export_state(self) -> dict:
         """Everything needed to resume this portfolio in a later process.
@@ -68,6 +72,10 @@ class Portfolio:
     def mark_new_day(self, day: date, current_prices: dict[str, float]) -> None:
         """Call once per calendar day before evaluating any new signals, so
         max-daily-loss is measured against that day's opening equity."""
+        week = day.isocalendar()[:2]
+        if self._week_key != week:
+            self._week_key = week
+            self._week_start_equity = self.equity(current_prices)
         if self._current_day != day:
             self._current_day = day
             self._day_start_equity = self.equity(current_prices)
@@ -81,6 +89,13 @@ class Portfolio:
 
     def daily_pnl(self, current_prices: dict[str, float]) -> float:
         return self.equity(current_prices) - self._day_start_equity
+
+    def weekly_pnl(self, current_prices: dict[str, float]) -> float:
+        return self.equity(current_prices) - self._week_start_equity
+
+    @property
+    def week_start_equity(self) -> float:
+        return self._week_start_equity
 
     @property
     def day_start_equity(self) -> float:

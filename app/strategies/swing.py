@@ -18,6 +18,7 @@ from typing import Optional
 
 from app.config import SwingStrategyConfig
 from app.models import Bar, DataQuality, Position, Signal, SignalAction
+from app.selection.volume import relative_volume
 from app.strategies.base import Strategy
 
 
@@ -93,6 +94,15 @@ class SwingMAStrategy(Strategy):
         crossed_down = fast_prev >= slow_prev and fast_curr < slow_curr
 
         if position is None:
+            if crossed_up and cfg.volume_filter_enabled:
+                rv = relative_volume(bars, cfg.volume_lookback)
+                inputs["relative_volume"] = rv
+                if rv is None or rv < cfg.min_relative_volume:
+                    return no_trade(
+                        f"bullish crossover rejected by volume filter: relative volume "
+                        f"{'n/a' if rv is None else f'{rv:.2f}'} < {cfg.min_relative_volume}",
+                        inputs,
+                    )
             if crossed_up:
                 return Signal(
                     signal_id=self._signal_id(now_bar),

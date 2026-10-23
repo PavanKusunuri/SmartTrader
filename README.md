@@ -192,3 +192,33 @@ must not be used to draw any conclusion about a real stock.
 - [docs/RISK_AND_LIMITATIONS.md](docs/RISK_AND_LIMITATIONS.md) — **read this before trusting any number**
 - [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) — PowerShell commands and troubleshooting
 - [docs/BUILD_LOG.md](docs/BUILD_LOG.md) — what changed in each milestone
+
+## Importing NSE daily data (DAILY / swing research only)
+
+Download `CM-UDiFF Common Bhavcopy Final` files by hand from
+https://www.nseindia.com/all-reports (one `.csv` or `.csv.zip` per trading
+date, UDiFF format, available from 2024-07-08). The app has no network
+downloader by design: NSE blocks automation and this project does not bypass it.
+
+```powershell
+.venv\Scripts\python -m app.cli import-bhavcopy C:\path\to\downloads --start 2025-01-01 --end 2025-03-31 --symbols TCS,INFY --holidays holidays.csv
+```
+
+- Originals are copied unchanged to `data/raw/`; normalized per-symbol daily CSVs
+  (`date,open,high,low,close,volume`) go to `data/processed/`; a JSON manifest
+  (source, import time, sha256, successful/failed dates, missing sessions,
+  parser version, warnings) goes to `data/manifests/`.
+- Re-importing is idempotent. Bad ZIPs, legacy-format files, wrong reports and
+  invalid OHLC rows are reported and excluded, never repaired or filled.
+- Missing weekdays are reported; supply a holidays CSV to suppress real holidays.
+- Prices are **unadjusted** for splits/bonuses. Daily data says nothing about intraday fills.
+
+```powershell
+.venv\Scripts\python -m app.cli universe --data-dir data\processed      # why each symbol is in/out
+.venv\Scripts\python -m app.cli backtest --data-dir data\processed --symbols TCS --strategy swing
+.venv\Scripts\python -m app.cli compare --volume-variant                # price-only vs volume-filtered swing
+```
+
+Volume filter (`swing.volume_filter_enabled`, `volume_lookback`, `min_relative_volume`)
+is off by default. Weekly loss brake: `risk.max_weekly_loss_pct` (default 6%; baseline
+resets on process restart).
