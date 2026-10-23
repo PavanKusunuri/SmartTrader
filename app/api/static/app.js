@@ -832,6 +832,21 @@ const risk = {
     ];
 
     root.innerHTML = `<div class="space-y-4">
+      ${panel('How much can I risk?', `<div class="space-y-3 px-4 py-4">
+          <div class="flex flex-wrap items-end gap-3 text-xs">
+            <label class="flex flex-col gap-1">Your capital (₹)
+              <input id="rb-capital" type="number" min="1" step="1000" value="100000"
+                class="w-40 rounded border border-slate-300 bg-transparent px-2 py-1 dark:border-slate-600"></label>
+            <label class="flex flex-col gap-1">Risk profile
+              <select id="rb-profile" class="rounded border border-slate-300 bg-transparent px-2 py-1 dark:border-slate-600">
+                <option value="conservative">Conservative</option>
+                <option value="moderate" selected>Moderate</option>
+                <option value="aggressive">Aggressive</option>
+              </select></label>
+          </div>
+          <div id="rb-result" class="text-xs">${loading('risk budget')}</div>
+        </div>`, { note: 'Calculator only: it changes no setting and places nothing. Rules of thumb, not financial advice.' })}
+
       ${panel('Kill switch', `<div class="flex flex-wrap items-center gap-3 px-4 py-4">
           <div class="text-2xl">${ks.enabled ? badge('ENABLED', 'red') : badge('DISABLED', 'green')}</div>
           <div class="min-w-0 flex-1 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
@@ -868,6 +883,40 @@ const risk = {
         : emptyState('No rejected orders recorded', 'Nothing was blocked by a risk check in the recorded runs.'),
         { note: 'Every rejection recorded by the paper broker, including sizing-to-zero and limit breaches.' })}
     </div>`;
+
+    const capEl = document.getElementById('rb-capital');
+    const profEl = document.getElementById('rb-profile');
+    const out = document.getElementById('rb-result');
+    let seq = 0;
+    const refresh = async () => {
+      const mine = ++seq;
+      const capital = Number(capEl.value);
+      if (!(capital > 0)) { out.innerHTML = notice('Enter a capital above zero.', 'amber'); return; }
+      try {
+        const r = await fetch(`/api/risk-budget?capital=${encodeURIComponent(capital)}&profile=${encodeURIComponent(profEl.value)}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const b = await r.json();
+        if (mine !== seq) return;
+        const L = b.limits;
+        const row = (name, v) => [name, `<b>${pct(v.pct, { digits: 2 })}</b> = ${money(v.rupees)}`];
+        out.innerHTML = kv([
+          row('Risk per trade', L.risk_per_trade),
+          row('Max loss per day (then stop)', L.max_daily_loss),
+          row('Max loss per week (then stop)', L.max_weekly_loss),
+          row('Max drawdown from peak (then halt)', L.max_drawdown),
+          row('Max single position', L.max_position_size),
+          row('Max total invested', L.max_total_exposure),
+          ['Max open positions', num(L.max_open_positions, 0)],
+          ['Worst case, all stopped out', `<b>${pct(b.worst_case_all_stopped.pct, { digits: 2 })}</b> = ${money(b.worst_case_all_stopped.rupees)}`],
+          ...b.implied_position_sizes.map((s) => [`Position size at ${(s.stop_distance_pct * 100).toFixed(0)}% stop (${s.style})`, money(s.position_value)]),
+        ]) + b.warnings.map((w) => notice(w, 'amber')).join('') + `<div class="mt-2 text-[11px] text-slate-500">${esc(b.disclaimer)}</div>`;
+      } catch (e) {
+        if (mine === seq) out.innerHTML = errorState(e.message);
+      }
+    };
+    capEl.addEventListener('input', refresh);
+    profEl.addEventListener('change', refresh);
+    refresh();
   },
 };
 

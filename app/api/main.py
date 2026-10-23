@@ -998,6 +998,29 @@ def create_app(
             ),
         }
 
+    @app.get("/api/risk-budget")
+    def risk_budget(
+        capital: float | None = None, profile: str = "moderate"
+    ) -> dict[str, Any]:
+        """Risk budget (percent and rupees) for a capital figure. A calculator:
+        it reads nothing from the ledger and changes no setting."""
+
+        from app.paper.risk_budget import (
+            PROFILES, compute_risk_budget, risk_limits_for_profile,
+        )
+
+        cap = capital if capital is not None else config.starting_cash
+        if cap <= 0 or cap > 1e12:
+            raise HTTPException(status_code=422, detail="capital must be positive")
+        if profile not in PROFILES:
+            raise HTTPException(
+                status_code=422, detail=f"profile must be one of {sorted(PROFILES)}"
+            )
+        out = compute_risk_budget(cap, risk_limits_for_profile(profile), config.viability)
+        out["profile"] = profile
+        out["profiles"] = sorted(PROFILES)
+        return out
+
     # -------------------------------------------------------------- health
 
     @app.get("/api/health")

@@ -767,3 +767,12 @@ Full suite: see run below.
 - Not done: the dashboard capital panel was not changed, universe scans are saved as CSV not SQLite,
   news/events and surveillance flags have no data source, volume-vs-price-only comparison on real
   data awaits imported files (only synthetic samples were run).
+
+## 2026-10-23 — Risk budget calculator
+
+- `app/paper/risk_budget.py`: capital + profile (conservative/moderate/aggressive rules of thumb) ->
+  percent and rupee limits, worst case if all positions stop out, implied position sizes, warnings.
+- Surfaces: `python -m app.cli risk-budget --capital 100000 --profile moderate`, `GET /api/risk-budget`,
+  and a calculator panel on the dashboard Risk page. It changes no setting; profiles are not advice.
+- `tests/test_risk_budget.py`: 6 tests. Full suite: 419 passed. The dashboard JS was syntax-checked
+  with `node --check` but not exercised in a browser.

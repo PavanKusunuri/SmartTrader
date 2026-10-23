@@ -543,6 +543,54 @@ def cmd_universe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check_env(args: argparse.Namespace) -> int:
+    """Report which Groww variables are set. Never prints a value."""
+    from app.groww_env import load_groww_credentials
+
+    creds = load_groww_credentials(args.env_file)
+    print("PAPER TRADING — NO REAL ORDERS (credentials are for read-only data only)")
+    for name, ok in creds.present().items():
+        print(f"  {name}: {'set' if ok else 'not set'}")
+    mode = creds.auth_mode()
+    print(f"Auth mode: {mode or 'none complete'}")
+    return 0 if mode else 1
+
+
+def cmd_risk_budget(args: argparse.Namespace) -> int:
+    """Prints how much of your capital each risk limit allows. Changes nothing."""
+    from app.config import RiskLimits
+    from app.paper.risk_budget import compute_risk_budget, risk_limits_for_profile
+
+    print(BANNER)
+    if args.risk_per_trade_pct is not None:
+        limits = RiskLimits(risk_per_trade_pct=args.risk_per_trade_pct / 100)
+        label = f"custom ({args.risk_per_trade_pct}% per trade, other limits default)"
+    else:
+        limits = risk_limits_for_profile(args.profile)
+        label = args.profile
+    b = compute_risk_budget(args.capital, limits)
+
+    print(f"\nCapital: Rs {b['capital']:,.0f}   Profile: {label}\n")
+    names = {
+        "risk_per_trade": "Risk per trade", "max_daily_loss": "Max daily loss",
+        "max_weekly_loss": "Max weekly loss", "max_drawdown": "Max drawdown (halt)",
+        "max_position_size": "Max position size", "max_total_exposure": "Max total exposure",
+    }
+    for key, name in names.items():
+        v = b["limits"][key]
+        print(f"  {name:<22}{v['pct']:>7.2%}   Rs {v['rupees']:>12,.2f}")
+    print(f"  {'Max open positions':<22}{b['limits']['max_open_positions']:>7}")
+    w = b["worst_case_all_stopped"]
+    print(f"\n  Worst case, all positions stopped: {w['pct']:.2%} = Rs {w['rupees']:,.2f}")
+    for s in b["implied_position_sizes"]:
+        print(f"  Implied position at {s['stop_distance_pct']:.0%} stop ({s['style']}): "
+              f"Rs {s['position_value']:,.0f} (capped by {s['capped_by']})")
+    for warning in b["warnings"]:
+        print(f"\n  WARNING: {warning}")
+    print(f"\n{b['disclaimer']}")
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Starts the read-only local dashboard."""
 
@@ -723,6 +771,20 @@ def main(argv: list[str] | None = None) -> int:
     un.add_argument("--min-traded-value", type=float, default=2e7)
     un.add_argument("--min-bars", type=int, default=60)
     un.set_defaults(func=cmd_universe)
+
+    rb = sub.add_parser(
+        "risk-budget", help="Show how much of your capital you can risk (percent and rupees)"
+    )
+    rb.add_argument("--capital", type=float, default=100_000.0, help="your trading capital, Rs")
+    rb.add_argument("--profile", choices=["conservative", "moderate", "aggressive"],
+                    default="moderate")
+    rb.add_argument("--risk-per-trade-pct", type=float, default=None,
+                    help="override per-trade risk, in percent (e.g. 1.5)")
+    rb.set_defaults(func=cmd_risk_budget)
+
+    ce = sub.add_parser("check-env", help="Check which Groww .env variables are set (no values shown)")
+    ce.add_argument("--env-file", default=".env")
+    ce.set_defaults(func=cmd_check_env)
 
     args = parser.parse_args(argv)
     return args.func(args)
