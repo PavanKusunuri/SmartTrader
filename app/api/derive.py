@@ -86,6 +86,12 @@ def derive_order_economics(
     side = SignalAction.BUY if side_raw == "BUY" else SignalAction.SELL
     rate = costs.slippage_rate
 
+    # Delivery and intraday have different STT, stamp duty and DP charges, so
+    # the leg must be re-priced with the profile it was actually charged under.
+    # A row recorded before that column existed has no profile; say so instead
+    # of quietly pricing it as delivery.
+    profile, profile_assumed = _charge_profile(order)
+
     # Inverse of compute_slippage: a BUY filled higher than basis, a SELL lower.
     if side == SignalAction.BUY:
         basis = filled_price / (1 + rate) if rate != -1 else None
@@ -95,14 +101,42 @@ def derive_order_economics(
         return {**unavailable, "unavailable_reason": "degenerate slippage rate"}
 
     per_share = filled_price - basis
+    try:
+        leg_costs = compute_order_costs(filled_price, filled_qty, side, costs, profile)
+    except TypeError:
+        # Older cost model without a profile parameter.
+        leg_costs = compute_order_costs(filled_price, filled_qty, side, costs)
+        profile_assumed = False
+
     return {
         "derived": True,
         "fill_price_basis": round(basis, 4),
         "slippage_per_share": round(per_share, 4),
         "slippage_total": round(abs(per_share) * filled_qty, 2),
-        "costs": compute_order_costs(filled_price, filled_qty, side, costs),
+        "costs": leg_costs,
+        "charge_profile": getattr(profile, "value", str(profile)),
+        "charge_profile_assumed": profile_assumed,
         "unavailable_reason": None,
     }
+
+
+def _charge_profile(order: dict[str, Any]):
+    """Returns (profile, assumed) for an order leg.
+
+    `assumed` is True when the order did not record a profile, so the caller
+    can mark the derived cost as resting on an assumption rather than on a
+    recorded fact.
+    """
+
+    from app.models import ChargeProfile
+
+    raw = order.get("charge_profile")
+    if raw:
+        try:
+            return ChargeProfile(str(raw).upper()), False
+        except ValueError:
+            pass
+    return ChargeProfile.DELIVERY, True
 
 
 def position_marks(position: dict[str, Any], portfolio_value: float | None) -> dict[str, Any]:

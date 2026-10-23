@@ -17,6 +17,8 @@ env/
 # Local data / secrets — never commit these
 .env
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
 *.sqlite3-journal
 # SQLite WAL sidecars (sqlite.py uses journal_mode=WAL)

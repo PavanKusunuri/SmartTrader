@@ -12,9 +12,10 @@ from datetime import datetime
 
 from app.backtest.costs import compute_order_costs, compute_slippage
 from app.config import AppConfig
-from app.models import Order, OrderStatus, Signal, SignalAction
+from app.models import ChargeProfile, Order, OrderStatus, Signal, SignalAction
 from app.paper.portfolio import Portfolio
 from app.paper.risk import RiskManager
+from app.paper.viability import TradeEconomics, assess_trade, minimum_viable_quantity
 
 
 class PaperBroker:
@@ -26,6 +27,10 @@ class PaperBroker:
         self.risk = RiskManager(config.risk)
         self.orders: list[Order] = []
         self._processed_signal_ids: set[str] = set()
+        # Economics computed for every BUY the broker priced, keyed by order
+        # id, including the ones it rejected. Kept so the dashboard and the
+        # ledger can show *why* a setup was refused, not just that it was.
+        self.trade_economics: dict[str, TradeEconomics] = {}
 
     def process_signal(
         self,
@@ -94,8 +99,33 @@ class PaperBroker:
             )
 
         fill_price = compute_slippage(fill_price_basis, SignalAction.BUY, self.config.costs.slippage_rate)
-        costs = compute_order_costs(fill_price, quantity, SignalAction.BUY, self.config.costs)
+
+        # Cost viability is judged on the price the trade would actually fill
+        # at (slippage included), not the signal's clean close.
+        economics = assess_trade(
+            entry_price=fill_price,
+            quantity=quantity,
+            costs=self.config.costs,
+            policy=self.config.viability,
+            stop_loss=signal.stop_loss,
+            target=signal.target,
+            profile=signal.charge_profile,
+        )
+        if not economics.viable:
+            order = self._make_order(
+                signal,
+                quantity=quantity,
+                status=OrderStatus.REJECTED,
+                rejection_reason=self._viability_rejection_reason(signal, fill_price, economics),
+            )
+            self.trade_economics[order.order_id] = economics
+            return order
+
+        costs = compute_order_costs(
+            fill_price, quantity, SignalAction.BUY, self.config.costs, signal.charge_profile
+        )
         order = self._make_order(signal, quantity=quantity, status=OrderStatus.SUBMITTED)
+        self.trade_economics[order.order_id] = economics
 
         try:
             self.portfolio.apply_fill_buy(
@@ -107,6 +137,7 @@ class PaperBroker:
                 stop_loss=signal.stop_loss,
                 target=signal.target,
                 order_id=order.order_id,
+                charge_profile=signal.charge_profile,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced as a rejected order, not a crash
             order.status = OrderStatus.REJECTED
@@ -134,7 +165,15 @@ class PaperBroker:
 
         position = self.portfolio.positions[signal.symbol]
         fill_price = compute_slippage(fill_price_basis, SignalAction.SELL, self.config.costs.slippage_rate)
-        costs = compute_order_costs(fill_price, position.quantity, SignalAction.SELL, self.config.costs)
+        # The exit leg is costed under the profile the position was OPENED
+        # with, so a delivery entry is not cheaply exited at intraday rates.
+        costs = compute_order_costs(
+            fill_price,
+            position.quantity,
+            SignalAction.SELL,
+            self.config.costs,
+            position.charge_profile,
+        )
         order = self._make_order(signal, quantity=position.quantity, status=OrderStatus.SUBMITTED)
 
         self.portfolio.apply_fill_sell(
@@ -152,6 +191,35 @@ class PaperBroker:
         order.filled_quantity = position.quantity
         order.filled_at = fill_timestamp
         return order
+
+    def _viability_rejection_reason(
+        self, signal: Signal, fill_price: float, economics: TradeEconomics
+    ) -> str:
+        """Builds the rejection text, adding the smallest size that WOULD
+        clear the charges when one exists — "this needs at least N shares" is
+        actionable, "not viable" is not."""
+
+        reason = economics.reason
+        min_qty = minimum_viable_quantity(
+            entry_price=fill_price,
+            costs=self.config.costs,
+            policy=self.config.viability,
+            stop_loss=signal.stop_loss,
+            target=signal.target,
+            profile=signal.charge_profile,
+        )
+        if min_qty is None:
+            return (
+                f"{reason}. No position size clears these charges at this "
+                "entry/stop/target, so the setup itself is uneconomic"
+            )
+        if min_qty > economics.quantity:
+            return (
+                f"{reason}. Would need at least {min_qty} shares "
+                f"(Rs {min_qty * fill_price:,.2f}) for this setup to clear its own charges, "
+                f"but risk sizing allows only {economics.quantity}"
+            )
+        return reason
 
     def record_expired_order(self, signal: Signal, reason: str) -> Order:
         """Records a signal that could never be filled (e.g. no next bar to
@@ -178,6 +246,7 @@ class PaperBroker:
             submitted_at=signal.timestamp,
             status=status,
             rejection_reason=rejection_reason,
+            charge_profile=signal.charge_profile,
         )
         self.orders.append(order)
         return order

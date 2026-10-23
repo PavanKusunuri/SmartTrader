@@ -27,9 +27,11 @@ from app.config import AppConfig
 from app.data.csv_provider import CsvProvider
 from app.market_calendar import MarketSession, load_holidays
 from app.paper.broker import PaperBroker
+from app.paper.portfolio import Portfolio
 from app.scanner.scanner import ScanOutcome, Scanner
 from app.scanner.universe import InvalidWatchlist, Watchlist
 from app.storage.persist import persist_run
+from app.storage.scanner_state import ScannerStateStore
 from app.storage.sqlite import RESET_CONFIRMATION_TOKEN, SqliteRepository
 from app.strategies.intraday import IntradayMomentumStrategy
 from app.strategies.swing import SwingMAStrategy
@@ -306,7 +308,17 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     session = _build_session(args)
     strategy = _strategy_factory(args, config)()
-    broker = PaperBroker(config)
+    # With --db, the scanner resumes the virtual portfolio and the set of bars
+    # it has already acted on from the previous invocation. Without --db there
+    # is nowhere to keep them, so every run starts flat.
+    state_store = ScannerStateStore(args.db) if args.db else None
+    saved_state = state_store.load_portfolio_state() if state_store else None
+    if saved_state is not None:
+        portfolio = Portfolio.from_state(saved_state)
+        broker = PaperBroker(config, portfolio=portfolio)
+    else:
+        broker = PaperBroker(config)
+
     scanner = Scanner(
         provider=CsvProvider(args.data_dir),
         strategy=strategy,
@@ -316,17 +328,33 @@ def cmd_scan(args: argparse.Namespace) -> int:
         interval=args.interval,
         max_bar_age=timedelta(minutes=args.max_bar_age_minutes),
     )
+    if state_store is not None:
+        scanner.restore_processed(state_store.load_processed())
 
     repo = SqliteRepository(args.db) if args.db else None
     print(f"\nWatchlist   : {', '.join(watchlist)} ({len(watchlist)} symbols)")
     print(f"Strategy    : {strategy.name}")
     print(f"Session     : {'enforced' if session else 'none (daily/swing mode)'}")
     print(f"Max bar age : {args.max_bar_age_minutes} minutes")
-    print(
-        "\nNOTE: the scanner's virtual cash and open positions live in memory for\n"
-        "this process only. Closed trades are written to the ledger, but open\n"
-        "positions are NOT restored on restart (see docs/RISK_AND_LIMITATIONS.md)."
-    )
+    if saved_state is not None:
+        held = ", ".join(p.symbol for p in saved_state["positions"]) or "none"
+        print(
+            f"\nRESUMED virtual portfolio from {args.db}: cash Rs {saved_state['cash']:,.2f}, "
+            f"open positions: {held}"
+        )
+        if abs(saved_state["starting_cash"] - config.starting_cash) > 0.005:
+            print(
+                f"NOTE: saved starting cash Rs {saved_state['starting_cash']:,.2f} differs from "
+                f"the configured Rs {config.starting_cash:,.2f}; the SAVED value is kept. "
+                "Run `reset` to start over with the new amount."
+            )
+    elif state_store is not None:
+        print(f"\nNo saved scanner portfolio in {args.db}; starting fresh and saving after each scan.")
+    else:
+        print(
+            "\nNOTE: no --db given, so this scan's virtual cash and positions are not saved.\n"
+            "Every run starts flat. Pass --db to resume across runs."
+        )
 
     exit_code = 0
     for scan_number in range(1, args.repeat + 1):
@@ -367,12 +395,20 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 },
             )
 
+        # Save AFTER the orders/trades above are written, so the saved cash and
+        # positions always correspond to fills already on record.
+        if state_store is not None:
+            state_store.save_portfolio_state(broker.portfolio.export_state())
+            state_store.save_processed(scanner.processed_bars)
+
         if scan_number < args.repeat:
             time.sleep(args.every)
 
     if repo is not None:
         print(f"\nLedger: {args.db} (total trades stored: {repo.trade_count()})")
         repo.close()
+    if state_store is not None:
+        state_store.close()
 
     print(DISCLAIMER)
     return exit_code
@@ -384,13 +420,23 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
     print(BANNER)
     repo = SqliteRepository(args.db)
+    state_store = ScannerStateStore(args.db)
     counts = repo.table_counts()
+    # The scanner's saved portfolio is part of the simulation. A reset that
+    # left it behind would "erase" history while the scanner kept trading from
+    # the old cash and positions.
+    scanner_counts = state_store.row_counts()
     print(f"\nLedger: {Path(args.db).resolve()}")
-    for name, count in counts.items():
+    for name, count in {**counts, **scanner_counts}.items():
         print(f"  {name:<18}: {count}")
 
-    if sum(v for k, v in counts.items() if k != "app_events") == 0:
+    nothing_to_delete = (
+        sum(v for k, v in counts.items() if k != "app_events") == 0
+        and sum(scanner_counts.values()) == 0
+    )
+    if nothing_to_delete:
         print("\nNothing to delete; the ledger is already empty.")
+        state_store.close()
         repo.close()
         return 0
 
@@ -408,15 +454,18 @@ def cmd_reset(args: argparse.Namespace) -> int:
             typed = ""
         if typed != RESET_CONFIRMATION_TOKEN:
             print("Confirmation did not match. Nothing was deleted.")
+            state_store.close()
             repo.close()
             return 1
 
     deleted = repo.reset_ledger(RESET_CONFIRMATION_TOKEN)
+    deleted.update(state_store.clear())
     print("\nDeleted:")
     for name, count in deleted.items():
         if name != "app_events":
             print(f"  {name:<18}: {count}")
     print("\nThe app_events table is kept, so the reset itself stays on record.")
+    state_store.close()
     repo.close()
     return 0
 
@@ -467,7 +516,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print("\nPress Ctrl+C to stop.\n")
 
     uvicorn.run(
-        create_app(db_path=str(db_path), samples_dir=args.data_dir),
+        create_app(
+            db_path=str(db_path),
+            samples_dir=args.data_dir,
+            bhavcopy_dir=args.bhavcopy_dir,
+        ),
         host=args.host, port=args.port, log_level="info",
     )
     return 0
@@ -561,6 +614,11 @@ def main(argv: list[str] | None = None) -> int:
     sv = sub.add_parser("serve", help="Start the read-only local dashboard")
     sv.add_argument("--db", default="data/paper_trading.db")
     sv.add_argument("--data-dir", default=str(DEFAULT_SAMPLES_DIR))
+    sv.add_argument(
+        "--bhavcopy-dir", default=None,
+        help="Folder of NSE UDiFF bhavcopy files you downloaded by hand. "
+             "Optional; without it the Market Data page offers CSV only.",
+    )
     sv.add_argument(
         "--host", default="127.0.0.1",
         help="Default 127.0.0.1 (localhost only). Changing this exposes the "

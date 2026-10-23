@@ -40,6 +40,21 @@ class Bar:
     quality_notes: tuple[str, ...] = field(default_factory=tuple)
 
 
+class ChargeProfile(str, Enum):
+    """Which statutory charge schedule a trade is settled under.
+
+    Indian cash-equity charges differ materially between a delivery trade
+    (held overnight, STT on both legs, DP charge on the sell leg) and an
+    intraday trade (squared off same day, STT on the sell leg only, no DP
+    charge). Carrying the profile on the signal and the position means the
+    exit leg is costed the same way the entry was, instead of a single
+    blended guess.
+    """
+
+    DELIVERY = "DELIVERY"
+    INTRADAY = "INTRADAY"
+
+
 class SignalAction(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
@@ -64,6 +79,10 @@ class Signal:
     inputs: dict
     stop_loss: Optional[float] = None
     target: Optional[float] = None
+    # Charge schedule this trade would settle under, set by the strategy
+    # (intraday strategies square off same day; swing strategies take
+    # delivery). Drives the cost estimate and the viability gate.
+    charge_profile: ChargeProfile = ChargeProfile.DELIVERY
 
 
 class OrderStatus(str, Enum):
@@ -87,6 +106,9 @@ class Order:
     filled_quantity: int = 0
     filled_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
+    # Charge schedule this leg was priced under; recorded so the leg's costs
+    # can be re-derived later instead of assumed.
+    charge_profile: ChargeProfile = ChargeProfile.DELIVERY
 
 
 @dataclass
@@ -99,6 +121,7 @@ class Position:
     opened_at: Optional[datetime] = None
     entry_order_id: str = ""
     entry_costs: float = 0.0
+    charge_profile: ChargeProfile = ChargeProfile.DELIVERY
 
 
 @dataclass(frozen=True)
@@ -123,3 +146,4 @@ class Trade:
     # engine assumes the stop filled first (conservative), but the outcome
     # is marked here so these trades can be excluded or scrutinised.
     ambiguous_exit: bool = False
+    charge_profile: ChargeProfile = ChargeProfile.DELIVERY

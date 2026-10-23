@@ -25,7 +25,7 @@ from typing import Optional
 
 from app.config import IntradayStrategyConfig
 from app.market_calendar import MarketSession
-from app.models import Bar, DataQuality, Position, Signal, SignalAction
+from app.models import Bar, ChargeProfile, DataQuality, Position, Signal, SignalAction
 from app.strategies.base import Strategy
 
 
@@ -37,6 +37,8 @@ def _sma(values: list[float], period: int) -> Optional[float]:
 
 class IntradayMomentumStrategy(Strategy):
     name = "intraday_ma_momentum"
+    # Squared off within the session, so no DP charge and sell-side-only STT.
+    charge_profile = ChargeProfile.INTRADAY
 
     def __init__(
         self,
@@ -70,6 +72,7 @@ class IntradayMomentumStrategy(Strategy):
                 action=SignalAction.NO_TRADE,
                 reason=reason,
                 inputs=inputs,
+                charge_profile=self.charge_profile,
             )
 
         if now_bar.quality != DataQuality.OK:
@@ -130,6 +133,7 @@ class IntradayMomentumStrategy(Strategy):
                         f"<= slow MA({cfg.slow_ma_period})={slow_ma:.2f}"
                     ),
                     inputs=inputs,
+                    charge_profile=self.charge_profile,
                 )
             return no_trade("holding open position, trend still intact", inputs)
 
@@ -161,6 +165,7 @@ class IntradayMomentumStrategy(Strategy):
                 f"volume {now_bar.volume:.0f} > {cfg.volume_surge_multiple}x avg {avg_volume:.0f}"
             ),
             inputs=inputs,
+            charge_profile=self.charge_profile,
             stop_loss=round(now_bar.close * (1 - cfg.stop_loss_pct), 2),
             target=round(now_bar.close * (1 + cfg.target_pct), 2),
         )

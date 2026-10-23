@@ -10,6 +10,10 @@ Rules this module enforces, so the HTTP layer cannot get them wrong:
   `InvalidQuery`, which the API turns into a 400.
 - Filtering, sorting and pagination all happen in SQL, so the browser never
   receives a whole table.
+- Date filters compare the first 10 characters of the stored timestamp, NOT
+  SQLite's date(). date() parses an ISO8601 string with an offset and converts
+  it to UTC, so date('2024-01-10T00:00:00+05:30') is 2024-01-09 — which would
+  silently shift every midnight-IST bar into the previous day.
 - There is no endpoint, and no function here, that executes caller-supplied
   SQL.
 """
@@ -180,10 +184,10 @@ def query_trades(
         where.append("run_id = ?")
         params.append(run_id)
     if date_from:
-        where.append("date(exit_at) >= date(?)")
+        where.append("substr(exit_at, 1, 10) >= ?")
         params.append(date_from)
     if date_to:
-        where.append("date(exit_at) <= date(?)")
+        where.append("substr(exit_at, 1, 10) <= ?")
         params.append(date_to)
 
     column = _validated_sort(conn, "trades", sort, TRADE_SORTS, "exit_at")
@@ -268,10 +272,10 @@ def query_signals(
         where.append("run_id = ?")
         params.append(run_id)
     if date_from:
-        where.append("date(timestamp) >= date(?)")
+        where.append("substr(timestamp, 1, 10) >= ?")
         params.append(date_from)
     if date_to:
-        where.append("date(timestamp) <= date(?)")
+        where.append("substr(timestamp, 1, 10) <= ?")
         params.append(date_to)
 
     column = _validated_sort(conn, "signals", sort, SIGNAL_SORTS, "timestamp")
@@ -352,10 +356,10 @@ def query_orders(
         where.append("run_id = ?")
         params.append(run_id)
     if date_from:
-        where.append("date(submitted_at) >= date(?)")
+        where.append("substr(submitted_at, 1, 10) >= ?")
         params.append(date_from)
     if date_to:
-        where.append("date(submitted_at) <= date(?)")
+        where.append("substr(submitted_at, 1, 10) <= ?")
         params.append(date_to)
 
     column = _validated_sort(conn, "orders", sort, ORDER_SORTS, "submitted_at")
@@ -572,10 +576,10 @@ def browse_table(
         None,
     )
     if date_from and date_column:
-        where.append(f'date("{date_column}") >= date(?)')
+        where.append(f'substr("{date_column}", 1, 10) >= ?')
         params.append(date_from)
     if date_to and date_column:
-        where.append(f'date("{date_column}") <= date(?)')
+        where.append(f'substr("{date_column}", 1, 10) <= ?')
         params.append(date_to)
 
     sort_column = sort or date_column or columns[0]["name"]

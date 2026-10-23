@@ -123,6 +123,22 @@ const STATUS_TONE = {
 };
 const statusBadge = (value, title = '') => badge(value, STATUS_TONE[String(value).toUpperCase()] || 'slate', title);
 
+/* Data-kind labels carry real consequences, so each gets its own tone and an
+ * explanation of what the data is NOT. Synthetic data is amber because acting
+ * on it would be a mistake; bhavcopy is blue because it is real but
+ * unadjusted, which is a different kind of caution. */
+const DATA_KIND_META = {
+  SAMPLE_SYNTHETIC: ['amber', 'Generated test data. Describes no real company and must not inform any decision.'],
+  NSE_BHAVCOPY_EOD: ['blue', 'Real NSE exchange-published end-of-day data from a file you downloaded by hand. Unadjusted for corporate actions, and end-of-day only — not a quote.'],
+  HISTORICAL_CSV: ['slate', 'A CSV you supplied. This app cannot verify whether it is real market data.'],
+};
+
+function dataKindBadge(kind) {
+  if (!kind) return MISSING;
+  const [tone, why] = DATA_KIND_META[kind] || ['slate', ''];
+  return badge(kind, tone, why);
+}
+
 function card(label, valueHtml, { hint = '', wide = false } = {}) {
   return `<div class="rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900 ${wide ? 'sm:col-span-2' : ''}">
     <div class="text-[11px] font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">${esc(label)}</div>
@@ -643,7 +659,22 @@ const orders = listPage({
     { key: 'basis', label: 'Pre-slip ₹', align: 'right', render: (r) => r.economics && r.economics.fill_price_basis !== null ? `${num(r.economics.fill_price_basis)}<span class="ml-1 text-[10px] text-slate-400" title="Derived from the run's recorded slippage rate, not stored">derived</span>` : MISSING },
     { key: 'filled_price', label: 'Fill ₹', align: 'right', render: (r) => num(r.filled_price) },
     { key: 'slippage', label: 'Slippage ₹', align: 'right', render: (r) => r.economics && r.economics.slippage_total !== null ? `${num(r.economics.slippage_total)}<span class="ml-1 text-[10px] text-slate-400" title="Derived">derived</span>` : MISSING },
-    { key: 'costs', label: 'Costs ₹', align: 'right', render: (r) => r.economics && r.economics.costs !== null ? `${num(r.economics.costs)}<span class="ml-1 text-[10px] text-slate-400" title="Derived from the run's recorded cost assumptions">derived</span>` : MISSING },
+    { key: 'costs', label: 'Costs ₹', align: 'right', render: (r) => {
+        const e = r.economics;
+        if (!e || e.costs === null) return MISSING;
+        const assumed = e.charge_profile_assumed;
+        const label = assumed ? 'assumed' : 'derived';
+        const why = assumed
+          ? `Derived, but this order recorded no charge profile, so DELIVERY rates were assumed. Delivery and intraday charge different STT, stamp duty and DP fees, so this figure may be wrong for an intraday order.`
+          : `Derived from the run's recorded cost assumptions under the ${e.charge_profile} charge profile.`;
+        return `${num(e.costs)}<span class="ml-1 text-[10px] ${assumed ? 'text-amber-600 dark:text-amber-400' : 'text-slate-400'}" title="${esc(why)}">${label}</span>`;
+      } },
+    { key: 'charge_profile', label: 'Charge profile', render: (r) => {
+        const e = r.economics || {};
+        if (!e.charge_profile) return MISSING;
+        return badge(e.charge_profile, e.charge_profile_assumed ? 'amber' : 'slate',
+          e.charge_profile_assumed ? 'Not recorded on this order; DELIVERY assumed' : 'Recorded on this order');
+      } },
     { key: 'submitted_at', label: 'Submitted', sort: 'submitted_at', render: (r) => ts(r.submitted_at) },
     { key: 'filled_at', label: 'Filled', sort: 'filled_at', render: (r) => r.filled_at ? ts(r.filled_at) : badge('never filled', 'slate') },
     { key: 'rejection_reason', label: 'Reject / cancel reason', render: (r) => r.rejection_reason ? `<span class="block max-w-md truncate text-amber-800 dark:text-amber-300" title="${esc(r.rejection_reason)}">${esc(r.rejection_reason)}</span>` : '<span class="text-slate-400">—</span>' },
@@ -681,7 +712,7 @@ const positions = {
       { key: 'target', label: 'Target', align: 'right', render: (r) => num(r.target) },
       { key: 'exposure_pct', label: 'Exposure %', align: 'right', render: (r) => pct(r.exposure_pct) },
       { key: 'holding_days', label: 'Held (days)', align: 'right', render: (r) => num(r.holding_days, 0) },
-      { key: 'last_price_kind', label: 'Data', render: (r) => badge(r.last_price_kind, r.last_price_kind === 'SAMPLE_SYNTHETIC' ? 'amber' : 'slate', r.last_price_kind === 'SAMPLE_SYNTHETIC' ? 'Synthetic sample data — describes no real company' : 'User-supplied historical CSV') },
+      { key: 'last_price_kind', label: 'Data', render: (r) => dataKindBadge(r.last_price_kind) },
       { key: 'breaches', label: 'Warnings', render: (r) => (r.breaches || []).length ? (r.breaches || []).map((b) => badge('!', 'red', b)).join(' ') + `<span class="ml-1 text-[11px] text-rose-700 dark:text-rose-400">${esc(r.breaches[0])}</span>` : '<span class="text-slate-400">—</span>' },
     ];
 
@@ -844,18 +875,60 @@ const risk = {
 
 const marketdata = {
   symbol: null,
+  source: 'csv',
   async render() {
     const root = el('marketdata');
     root.innerHTML = loading('market data');
-    let list;
-    try { list = await getJSON('/api/marketdata/watchlist', 'watchlist'); } catch (e) {
+    let sources, list;
+    try {
+      [sources, list] = await Promise.all([
+        getJSON('/api/marketdata/sources', 'md-sources'),
+        getJSON(`/api/marketdata/watchlist?source=${encodeURIComponent(this.source)}`, 'watchlist'),
+      ]);
+    } catch (e) {
       root.innerHTML = errorState(e.message); return;
     }
-    if (list.stale) return;
+    if (sources.stale || list.stale) return;
+
+    const sourcePicker = `<div class="flex flex-wrap items-center gap-2">
+      <span class="text-[11px] font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Source</span>
+      ${(sources.sources || []).map((s) => {
+        const active = s.key === this.source;
+        const disabled = !s.configured;
+        return `<button data-source="${esc(s.key)}" ${disabled ? 'disabled' : ''}
+          title="${esc(disabled ? (s.how_to_enable || 'Not configured') : s.directory || '')}"
+          class="rounded border px-2 py-1 text-xs font-medium ${active
+            ? 'border-indigo-500 bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300'
+            : 'border-slate-300 hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800'}
+            ${disabled ? 'cursor-not-allowed opacity-50' : ''}">${esc(s.label)}${disabled ? ' (not configured)' : ''}</button>`;
+      }).join('')}
+    </div>`;
+
+    const caveats = (list.caveats || []).length
+      ? `<ul class="list-disc space-y-1 pl-5">${list.caveats.map((c) => `<li>${esc(c)}</li>`).join('')}</ul>`
+      : '';
+    const caveatPanel = caveats
+      ? panel('What this data is and is not', `<div class="px-4 py-3 text-xs leading-relaxed text-slate-700 dark:text-slate-300">${caveats}</div>`)
+      : '';
+
+    const wireSources = () => {
+      root.querySelectorAll('[data-source]').forEach((b) => b.addEventListener('click', () => {
+        if (b.disabled) return;
+        this.source = b.dataset.source;
+        this.symbol = null;
+        this.render();
+      }));
+    };
 
     if (!list.rows.length) {
-      root.innerHTML = panel('Watchlist', emptyState('No data files found',
-        list.error || `No CSV files in ${list.directory}. Add CSVs or regenerate samples with: python scripts\\generate_sample_data.py`));
+      root.innerHTML = `<div class="space-y-4">
+        ${panel('Data source', `<div class="px-4 py-3">${sourcePicker}</div>`)}
+        ${caveatPanel}
+        ${panel('Watchlist', emptyState(
+          list.error ? 'This source could not be read' : 'No symbols available from this source',
+          list.error || `Nothing found in ${list.directory}. For CSV, regenerate samples with: python scripts\\generate_sample_data.py`))}
+      </div>`;
+      wireSources();
       return;
     }
 
@@ -864,17 +937,22 @@ const marketdata = {
     }
 
     let bars;
-    try { bars = await getJSON(`/api/marketdata/bars/${encodeURIComponent(this.symbol)}?limit=240`, 'bars'); } catch (e) {
+    try {
+      bars = await getJSON(
+        `/api/marketdata/bars/${encodeURIComponent(this.symbol)}?limit=240&source=${encodeURIComponent(this.source)}`,
+        'bars',
+      );
+    } catch (e) {
       bars = { error: e.message, rows: [], provider_status: 'ERROR' };
     }
     if (bars.stale) return;
 
     const wlCols = [
       { key: 'symbol', label: 'Symbol', render: (r) => `<button data-symbol="${esc(r.symbol)}" class="font-medium ${r.symbol === this.symbol ? 'text-indigo-700 underline dark:text-indigo-400' : 'hover:underline'}">${esc(r.symbol)}</button>` },
-      { key: 'file', label: 'File', render: (r) => `<code class="font-mono text-[11px]">${esc(r.file)}</code>` },
-      { key: 'data_kind', label: 'Data kind', render: (r) => badge(r.data_kind, r.data_kind === 'SAMPLE_SYNTHETIC' ? 'amber' : 'slate', r.data_kind === 'SAMPLE_SYNTHETIC' ? 'Generated test data. Describes no real company and must not inform any decision.' : 'User-supplied historical CSV') },
-      { key: 'file_modified_ist', label: 'File modified', render: (r) => ts(r.file_modified_ist) },
-      { key: 'size_bytes', label: 'Size', align: 'right', render: (r) => `<span class="nums">${(r.size_bytes / 1024).toFixed(1)} KB</span>` },
+      { key: 'file', label: 'File', render: (r) => r.file ? `<code class="font-mono text-[11px]">${esc(r.file)}</code>` : '<span class="text-slate-400" title="A bhavcopy is one file per DATE covering every symbol, so there is no per-symbol file">per-date file</span>' },
+      { key: 'data_kind', label: 'Data kind', render: (r) => dataKindBadge(r.data_kind) },
+      { key: 'file_modified_ist', label: 'File modified', render: (r) => r.file_modified_ist ? ts(r.file_modified_ist) : '<span class="text-slate-400">—</span>' },
+      { key: 'size_bytes', label: 'Size', align: 'right', render: (r) => r.size_bytes === null || r.size_bytes === undefined ? '<span class="text-slate-400">—</span>' : `<span class="nums">${(r.size_bytes / 1024).toFixed(1)} KB</span>` },
     ];
 
     const barCols = [
@@ -893,7 +971,7 @@ const marketdata = {
         ${card('Latest bar', latest ? dateOnly(latest.timestamp) : MISSING)}
         ${card('Close', latest ? num(latest.close) : MISSING)}
         ${card('Bars available', num(bars.bar_count, 0))}
-        ${card('Data kind', badge(bars.data_kind, bars.data_kind === 'SAMPLE_SYNTHETIC' ? 'amber' : 'slate'))}
+        ${card('Data kind', dataKindBadge(bars.data_kind), { hint: bars.quote_available === false ? 'No quote available from this source' : '' })}
       </div>
       <div class="grid gap-3 lg:grid-cols-2">
         ${panel(`${this.symbol} — OHLC`, candleChart(bars.rows), { note: `Source: ${bars.source}. Read at ${bars.retrieved_at}. ${bars.note}` })}
@@ -920,11 +998,14 @@ const marketdata = {
     ` : notice(bars.error || 'The provider could not read this symbol.', 'red');
 
     root.innerHTML = `<div class="space-y-4">
-      ${notice(`Provider: ${list.provider} — file-based. ${list.note}`, 'blue')}
-      ${panel('Watchlist', table(wlCols, list.rows), { note: `Directory: ${list.directory}. There is no scanner or scheduler in this version, so nothing is polled automatically.` })}
+      ${panel('Data source', `<div class="px-4 py-3">${sourcePicker}</div>`, { note: sources.note })}
+      ${notice(`Provider: ${list.provider} — file-based. ${list.note || ''}`, 'blue')}
+      ${caveatPanel}
+      ${panel('Watchlist', table(wlCols, list.rows), { note: `Directory: ${list.directory}. There is no scanner or scheduler polling this automatically.${(list.files_loaded || []).length ? ` Files loaded: ${list.files_loaded.join(', ')}.` : ''}` })}
       ${detail}
     </div>`;
 
+    wireSources();
     root.querySelectorAll('[data-symbol]').forEach((b) => b.addEventListener('click', () => {
       this.symbol = b.dataset.symbol; this.render();
     }));

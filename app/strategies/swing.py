@@ -57,6 +57,7 @@ class SwingMAStrategy(Strategy):
                 action=SignalAction.NO_TRADE,
                 reason=reason,
                 inputs=inputs,
+                charge_profile=self.charge_profile,
             )
 
         if now_bar.quality != DataQuality.OK:
@@ -104,6 +105,7 @@ class SwingMAStrategy(Strategy):
                         f"slow MA({cfg.slow_ma_period})={slow_curr:.2f}"
                     ),
                     inputs=inputs,
+                    charge_profile=self.charge_profile,
                     stop_loss=round(now_bar.close * (1 - cfg.stop_loss_pct), 2),
                     target=round(now_bar.close * (1 + cfg.target_pct), 2),
                 )
@@ -125,6 +127,7 @@ class SwingMAStrategy(Strategy):
                     f"slow MA({cfg.slow_ma_period})={slow_curr:.2f}"
                 ),
                 inputs=inputs,
+                charge_profile=self.charge_profile,
             )
 
         if days_held is not None and days_held >= cfg.max_holding_days:
@@ -136,6 +139,7 @@ class SwingMAStrategy(Strategy):
                 action=SignalAction.SELL,
                 reason=f"max holding period reached ({days_held} >= {cfg.max_holding_days} days)",
                 inputs=inputs,
+                charge_profile=self.charge_profile,
             )
 
         return no_trade("holding open position, no exit condition met", inputs)

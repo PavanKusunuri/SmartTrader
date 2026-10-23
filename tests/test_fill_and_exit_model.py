@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.backtest.engine import run_backtest
-from app.config import AppConfig, RiskLimits, SwingStrategyConfig
+from app.config import AppConfig, RiskLimits, SwingStrategyConfig, ViabilityPolicy
 from app.data.base import DataProvider
 from app.market_calendar import MarketSession
 from app.models import Bar, DataQuality, OrderStatus, Position, Signal, SignalAction
@@ -70,10 +70,22 @@ def daily(symbol, day, o, h, l, c, **kw):
 
 
 def base_config(**risk):
+    """Config for fill/exit MECHANICS tests.
+
+    The cost-viability gate is disabled here deliberately: these tests use
+    synthetic prices with wide stops (e.g. a Rs 100 stock stopped at Rs 50),
+    which size down to order values the gate rightly refuses as uneconomic.
+    Leaving it on would make them assert "no trade" everywhere and stop
+    testing fills at all. The gate has its own tests in
+    tests/test_viability.py, and tests/test_broker.py checks that the broker
+    actually enforces it.
+    """
+
     return AppConfig(
         starting_cash=100_000,
         risk=RiskLimits(**risk) if risk else RiskLimits(max_position_pct=1.0),
         swing=SwingStrategyConfig(fast_ma_period=2, slow_ma_period=4),
+        viability=ViabilityPolicy(enabled=False),
     )
 
 

@@ -165,6 +165,12 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("orders", "run_id", "TEXT"),
     ("orders", "trade_id", "TEXT"),
     ("orders", "order_type", "TEXT"),
+    # Which charge profile (delivery/intraday) priced this leg. Required to
+    # re-derive the leg's costs correctly: the two profiles have different
+    # STT, stamp duty and DP charges, so assuming delivery for an intraday
+    # order would report the wrong number.
+    ("orders", "charge_profile", "TEXT"),
+    ("trades", "charge_profile", "TEXT"),
     # fill_price_basis/slippage/costs are nullable because the Order model
     # does not currently carry them. They are left NULL rather than guessed;
     # the API derives slippage and costs from the run's recorded cost
@@ -208,6 +214,14 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _enum_value(value: Any) -> Any:
+    """Stores an Enum by its value, so the column holds 'DELIVERY' rather than
+    a Python repr. Returns None/plain values unchanged, so a model that does
+    not carry the field yet simply records NULL."""
+
+    return getattr(value, "value", value)
+
+
 class SqliteRepository:
     """PAPER TRADING — NO REAL ORDERS. Stores simulated trades/orders only."""
 
@@ -248,8 +262,8 @@ class SqliteRepository:
                (trade_id, symbol, entry_order_id, exit_order_id, entry_price, exit_price,
                 quantity, entry_at, exit_at, gross_pnl, costs, net_pnl, exit_reason,
                 recorded_at, run_id, strategy_name, side, stop_loss, target, status,
-                ambiguous_exit)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ambiguous_exit, charge_profile)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 trade.trade_id, trade.symbol, trade.entry_order_id, trade.exit_order_id,
                 trade.entry_price, trade.exit_price, trade.quantity,
@@ -264,6 +278,7 @@ class SqliteRepository:
                 getattr(trade, "target", None),
                 "CLOSED",
                 1 if getattr(trade, "ambiguous_exit", False) else 0,
+                _enum_value(getattr(trade, "charge_profile", None)),
             ),
         )
         self._conn.commit()
@@ -274,8 +289,8 @@ class SqliteRepository:
             """INSERT OR REPLACE INTO orders
                (order_id, signal_id, symbol, side, quantity, submitted_at, status,
                 filled_price, filled_quantity, filled_at, rejection_reason, recorded_at,
-                run_id, trade_id, order_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                run_id, trade_id, order_type, charge_profile)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 order.order_id, order.signal_id, order.symbol, order.side.value,
                 order.quantity, order.submitted_at.isoformat(), order.status.value,
@@ -285,6 +300,7 @@ class SqliteRepository:
                 # The paper broker simulates market-style fills only; it has no
                 # limit/stop order types to record.
                 "MARKET",
+                _enum_value(getattr(order, "charge_profile", None)),
             ),
         )
         self._conn.commit()
@@ -532,11 +548,26 @@ def open_readonly(db_path: str | Path) -> sqlite3.Connection:
     Used by the dashboard API so a read path physically cannot write, even if
     a query were wrong. Raises sqlite3.OperationalError if the file does not
     exist — `mode=ro` deliberately will not create one.
+
+    `check_same_thread=False` is required, not a shortcut: FastAPI runs a sync
+    generator dependency and the endpoint that consumes it on DIFFERENT
+    threadpool threads, so a connection created in the dependency is used in
+    the endpoint and sqlite3's default same-thread guard rejects it. It is safe
+    here because each request gets its OWN connection and uses it
+    sequentially — create, query, close — so no connection is ever touched by
+    two threads at once. Do not share a connection returned by this function
+    between concurrent requests.
+
+    `busy_timeout` makes a reader wait briefly rather than fail outright if a
+    backtest is mid-write when the dashboard reads.
     """
 
     path = Path(db_path).resolve()
-    conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(
+        f"file:{path.as_posix()}?mode=ro", uri=True, check_same_thread=False
+    )
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

@@ -47,9 +47,13 @@ These are real weaknesses, deliberately documented rather than hidden:
 4. **Daily-loss limit uses day-start equity.** The max-daily-loss check is
    measured against equity at the start of the trading day, computed from the
    last available close. It is not a tick-by-tick intraday drawdown guard.
-5. **Exposure check uses entry prices, not live marks.** Existing exposure is
-   valued at average entry price when checking the max-exposure limit, which
-   understates exposure for a position that has moved up.
+5. ~~**Exposure check uses entry prices, not live marks.**~~ **FIXED.**
+   `Portfolio.existing_exposure_value()` now marks open positions to the
+   latest available price, falling back to average entry price only for a
+   symbol with no current mark. A position that has moved up can no longer
+   grow past the max-exposure limit unnoticed. The residual weakness is the
+   fallback itself: when no mark is available the old understatement still
+   applies, so exposure is only as current as the last price fed in.
 6. **No survivorship-bias handling.** The universe is whatever CSVs you
    supply. If you supply only symbols that still exist and did well, the
    results are biased and this tool cannot detect that for you.
@@ -73,12 +77,26 @@ These are real weaknesses, deliberately documented rather than hidden:
 
 ## Scanner limitations (Milestone 3)
 
-1. **The scanner's portfolio does not survive a restart.** Virtual cash and
-   open positions live in memory for the life of one `scan` process. Closed
-   trades and orders are written to the ledger, but open positions are NOT
-   reloaded on the next invocation. So repeated single-shot scans each start
-   flat. Until this is fixed, the scanner is a signal-generation and
-   decision-logging tool, not a continuous portfolio simulator.
+1. ~~**The scanner's portfolio does not survive a restart.**~~ **FIXED when
+   `--db` is given.** `scan --db <ledger>` now saves virtual cash, open
+   positions (including each position's charge profile), realized P&L and the
+   max-daily-loss baseline after every scan, and the next invocation resumes
+   from them. State lives in three scanner-only tables (`scanner_portfolio`,
+   `scanner_positions`, `scanner_processed`), kept separate from the backtest
+   `positions` table so a backtest's leftovers never look like the scanner's
+   holdings. **Residual weaknesses:**
+   - **Without `--db` nothing is saved** and every run starts flat; the CLI
+     says so. There is no implicit default ledger.
+   - A saved `starting_cash` wins over a different configured value (the CLI
+     prints a note). Use `reset` to start over with a new amount.
+   - **Not crash-proof between steps.** Orders/trades are written first, then
+     the portfolio snapshot (atomically). A process killed in the gap leaves
+     recorded orders that the saved cash/positions do not yet reflect, and the
+     next run will not notice. The snapshot itself is all-or-nothing.
+   - Two `scan` processes against one ledger at the same time are not
+     coordinated; the last to save wins.
+   - Closed trades are not reloaded into memory, only their realized P&L total
+     (carried forward so `reconcile()` still balances).
 2. **Live scanning fills at the latest close, not the next bar's open.** The
    backtest deliberately uses next-bar-open fills, but a live scan has no
    "next bar" yet, so the only price available is the newest close. This is
@@ -93,11 +111,14 @@ These are real weaknesses, deliberately documented rather than hidden:
 4. **No scheduler.** Scans run on demand or under an OS scheduler (Task
    Scheduler/cron). There is no supervised daemon, no retry/backoff policy
    across invocations, and nothing that notices a scan did not happen.
-5. **Idempotency is per-process.** The scanner will not re-trade the same
-   (symbol, bar) within one process. Across restarts that memory is lost, so
-   a fresh process could act on a bar a previous process already acted on.
-   The deterministic signal ID limits the damage within a process but does
-   not deduplicate across them.
+5. ~~**Idempotency is per-process.**~~ **FIXED when `--db` is given.** The
+   set of (symbol, bar) pairs already acted on is saved and restored, so a
+   fresh process reports `SKIPPED_DUPLICATE` instead of re-trading a bar a
+   previous process handled. Same caveat as above: without `--db` that memory
+   is lost. Because a bar is marked processed even when the strategy said
+   NO_TRADE, a restarted scan will not re-evaluate it either — deliberate, but
+   it means changing strategy parameters will not re-open already-seen bars
+   until you `reset`.
 
 ## Dashboard limitations
 

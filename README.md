@@ -2,9 +2,19 @@
 
 > **PAPER TRADING — NO REAL ORDERS.**
 > This application simulates trades with virtual money. It has no broker
-> integration, makes no network calls, and cannot place a real order.
+> integration, handles no broker credentials or API keys, and contains no code
+> path that can place, modify or cancel a real order. **That guarantee is
+> unconditional** — it does not depend on how you configure the app.
 > Simulated fills do not guarantee real-world fills or prices. Nothing here
 > is investment advice or a claim of profitability.
+
+> **Network access is a separate question.** Every data source shipped today is
+> file-based and makes no network call: CSV files, and NSE UDiFF bhavcopy files
+> you download yourself in a browser. Nothing is scraped, streamed, polled or
+> quoted. If an optional network data source is ever added and you switch it on,
+> that sentence stops being true for your install — but the no-real-orders
+> guarantee above still holds. The two are deliberately stated separately so the
+> important one is never weakened by the other.
 
 ## What works today (Milestones 1–3)
 
@@ -38,13 +48,17 @@
   and CSV export. Every route is a GET and the database is opened `mode=ro` —
   enforced by tests.
 - SQLite ledger that survives restarts, plus CSV export of closed trades.
-- 160 passing tests.
+- `scan --db <ledger>` resumes its virtual cash, open positions and
+  already-processed bars across runs (without `--db` every run starts flat).
+- Run the suite with `python -m pytest tests\` (the count changes often, so it
+  is not quoted here).
 
 ## Not built yet
 
 Telegram alerts, live data providers, a supervised scheduler, and cloud
-deployment. The scanner's open positions are also not restored across
-restarts — see [docs/RISK_AND_LIMITATIONS.md](docs/RISK_AND_LIMITATIONS.md).
+deployment. Scanner persistence has caveats (no crash-atomicity across the
+order-write and snapshot steps, no locking between concurrent scans) — see
+[docs/RISK_AND_LIMITATIONS.md](docs/RISK_AND_LIMITATIONS.md).
 See `CLAUDE.md` for the milestone plan.
 
 ## Quick start (Windows PowerShell)
@@ -91,10 +105,59 @@ python -m app.cli scan --symbols SAMPLE_TCS,SAMPLE_INFY `
 
 # 12. Start the read-only dashboard, then open http://127.0.0.1:8000
 python -m app.cli serve --db data\paper_trading.db
+
+# 13. Optional: also serve real NSE end-of-day data on the Market Data page.
+#     You download the "CM-UDiFF Common Bhavcopy Final" files yourself from
+#     nseindia.com (All Reports) in a browser and put them in one folder; the
+#     app never fetches them. Either .csv or .csv.zip works as served.
+python -m app.cli serve --db data\paper_trading.db --bhavcopy-dir data\bhavcopy
 ```
 
 Full setup notes, including common errors, are in
 [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md).
+
+## Your data is persistent — and how to back it up
+
+The ledger is a single SQLite file (default `data/paper_trading.db`). It is a
+plain file on disk, so **nothing is wiped when you restart the app, the
+dashboard, or your machine.** Re-running a backtest against the same `--db`
+*appends* a new run; it never replaces the previous one. Opening an older
+ledger with a newer build of the app only ever *adds* columns and tables
+(`ALTER TABLE ... ADD COLUMN`); no migration in this project drops, truncates,
+or recreates a table.
+
+Three things worth knowing:
+
+1. **The database is not in version control.** `*.db` is in `.gitignore`, so
+   deleting or re-cloning the folder loses your simulated history. Back it up
+   yourself.
+2. **Re-running the same backtest appends duplicate logical trades** under new
+   trade IDs. Each row records the `run_id` that produced it, so you can tell
+   the runs apart — but the duplication itself is real. Filter by run in the
+   dashboard, or reset between experiments.
+3. **The dashboard can never delete anything.** It opens the database with
+   SQLite's read-only flag and exposes no write, edit, delete, or raw-SQL
+   endpoint. Deleting history is possible only from the CLI, interactively.
+
+```powershell
+# Back up the ledger (copy all three files if the -wal/-shm sidecars exist)
+Copy-Item data\paper_trading.db "data\paper_trading.backup.db"
+Get-ChildItem data\paper_trading.db* | Copy-Item -Destination data\backup\
+
+# Export what you care about to CSV (also available from the dashboard)
+python -m app.cli backtest --symbols SAMPLE_TCS `
+    --db data\paper_trading.db --export-csv data\exports\trades.csv
+
+# Inspect the ledger without the dashboard
+python -c "import sqlite3; print(sqlite3.connect('data/paper_trading.db').execute('select count(*) from trades').fetchone())"
+
+# Delete ALL simulated history. Asks you to type a confirmation phrase;
+# keeps the app_events audit trail so the reset itself stays on record.
+python -m app.cli reset --db data\paper_trading.db
+```
+
+To restore a backup, stop the app and copy the file back over
+`data\paper_trading.db`.
 
 ## Using your own data
 

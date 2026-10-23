@@ -57,7 +57,9 @@ class RiskManager:
         if equity <= 0:
             return False, "portfolio equity is zero or negative"
 
-        new_exposure_value = portfolio.existing_exposure_value() + quantity * entry_price
+        new_exposure_value = (
+            portfolio.existing_exposure_value(current_prices) + quantity * entry_price
+        )
         if new_exposure_value > self.limits.max_total_exposure_pct * equity:
             return False, (
                 f"max total exposure exceeded: {new_exposure_value:.2f} > "

@@ -117,10 +117,20 @@
     </main>
 
     <footer class="border-t border-slate-200 px-4 py-3 text-[11px] leading-relaxed text-slate-500 dark:border-slate-800 dark:text-slate-400">
-      Research and paper-trading tool. Every fill, price and P&amp;L figure shown is
-      simulated from recorded historical bars and does not guarantee real-world
-      fills or prices. Cost and tax rates are user-configurable assumptions that
-      have not been verified against current official sources.
+      <!-- Two separate claims, deliberately not merged. The first is
+           unconditional and is the one that matters most; the second depends on
+           which data sources are configured and would change if an optional
+           network source were enabled. Conflating them would weaken the first. -->
+      <p><strong class="text-slate-700 dark:text-slate-300">No real orders, ever:</strong>
+      this application has no broker integration, handles no broker credentials
+      or API keys, and contains no code path that can place, modify or cancel a
+      real order. That holds regardless of how it is configured.</p>
+      <p class="mt-1">Every fill, price and P&amp;L figure shown is simulated from
+      recorded historical bars and does not guarantee real-world fills or prices.
+      Cost and tax rates are user-configurable assumptions that have not been
+      verified against current official sources. The data sources shipped here
+      read files from disk and make no network call; see the Market Data page for
+      what each source is and is not.</p>
     </footer>
   </div>
 </div>
