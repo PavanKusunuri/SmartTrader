@@ -710,3 +710,47 @@ files is not reflected by the commit author. Figures are from `git show
 --stat`.
 
 No live order placement exists or is possible.
+
+## 2026-10-23 — Strategy research and pre-check gate
+
+Requested: web research on the best swing/intraday strategies, added as
+pre-checks, favouring the most winning ones.
+
+- Researched via web search (secondary sources/abstracts only; no primary paper
+  read in full). Findings and links in `docs/STRATEGY_RESEARCH.md`.
+- **Did not rank by win rate**: no verified "most winning" strategy exists
+  (SEBI: 71% of individual NSE cash intraday traders lost money in FY23), and
+  win rate does not measure profit. Candidates are ranked by evidence quality.
+- New `app/prechecks/` (`candidates.py` registry, `gate.py` gate). The gate judges
+  net results in-sample and out-of-sample on non-synthetic data.
+- `tests/test_prechecks.py` — 10 passed (run in isolation; full suite not re-run).
+- Not wired into CLI/scanner; no new strategies implemented; thresholds are
+  judgement calls.
+
+No live order placement exists or is possible.
+
+## 2026-10-23 — Single-trade loss hardening
+
+Request: never lose the whole capital on one trade.
+
+Already present: 1% risk-per-trade sizing, 20% max position, 60% max exposure,
+3% daily loss limit, kill switch. Reviewing them found real gaps:
+
+- **Gap bug (engine).** A stop was filled at its level even when the bar opened
+  below it, understating the loss on exactly the event that causes large single-trade
+  losses. Now filled at `min(stop, open)`. Regression test added.
+- **Sizing assumed a perfect stop.** New `gap_buffer_pct` (default 1%) is added to
+  the stop distance when sizing, so a stop that fills a bit worse still stays within
+  the risk budget. Consequence: smaller positions, so small accounts more often fail
+  the cost-viability gate. Intended, but it will reduce trade count.
+- **No cumulative brake.** The daily limit resets each day. New `max_drawdown_pct`
+  (default 10%) halts new entries once equity is that far below its peak.
+- `Portfolio.reconcile()` tolerance now scales with trade count (per-trade paise
+  rounding drift); the flat 0.01 failed once positions sized differently.
+- Two test fixtures pin `gap_buffer_pct=0`, because they test persistence/sizing
+  arithmetic rather than risk.
+
+Limits: a gap can still exceed the buffer (overnight news); the stop cannot be
+guaranteed. Sizing uses cash, not equity. Drawdown peak is held in memory and
+resets on process restart (not persisted). Defaults are judgement calls.
+Full suite: see run below.

@@ -181,6 +181,11 @@ class RiskLimits(BaseModel):
     max_total_exposure_pct: float = Field(default=0.6, gt=0, le=1)
     max_daily_loss_pct: float = Field(default=0.03, gt=0, le=1)
     max_open_positions: int = Field(default=5, ge=1)
+    # Sizing assumes a stop can fill this far beyond its level (slippage/gap).
+    gap_buffer_pct: float = Field(default=0.01, ge=0, le=0.5)
+    # Halt new entries once equity falls this far below its peak (cumulative
+    # loss brake; max_daily_loss_pct only resets each day).
+    max_drawdown_pct: float = Field(default=0.10, gt=0, le=1)
     kill_switch_enabled: bool = Field(default=False)
 
 

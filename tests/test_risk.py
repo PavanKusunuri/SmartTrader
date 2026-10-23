@@ -10,7 +10,7 @@ def make_risk(**overrides) -> RiskManager:
 
 
 def test_position_size_respects_risk_per_trade():
-    risk = make_risk(risk_per_trade_pct=0.01, max_position_pct=1.0)
+    risk = make_risk(risk_per_trade_pct=0.01, max_position_pct=1.0, gap_buffer_pct=0)
     # 1% of 100,000 = 1,000 risk budget; stop distance 10 -> 100 shares
     qty = risk.position_size(cash=100_000, entry_price=100, stop_loss=90)
     assert qty == 100

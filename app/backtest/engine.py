@@ -186,6 +186,8 @@ def run_backtest(
                 )
 
         # --- 2. Intrabar stop-loss / target check on any open position.
+        # A stop is filled at min(stop, open): a bar that gaps below the stop
+        # fills at the open, not at the unreachable stop level.
         position = portfolio.positions.get(symbol)
         if position is not None and bar.quality != DataQuality.INVALID:
             stop = position.stop_loss
@@ -202,7 +204,7 @@ def run_backtest(
                     inputs={"bar_low": bar.low, "bar_high": bar.high, "stop": stop, "target": target},
                 )
                 broker.process_signal(
-                    exit_signal, fill_price_basis=stop, current_prices=current_prices,
+                    exit_signal, fill_price_basis=min(stop, bar.open), current_prices=current_prices,
                     fill_timestamp=bar.timestamp, ambiguous_exit=True,
                 )
             elif stop_touched:
@@ -211,7 +213,7 @@ def run_backtest(
                     inputs={"bar_low": bar.low, "stop": stop},
                 )
                 broker.process_signal(
-                    exit_signal, fill_price_basis=stop, current_prices=current_prices,
+                    exit_signal, fill_price_basis=min(stop, bar.open), current_prices=current_prices,
                     fill_timestamp=bar.timestamp,
                 )
             elif target_touched:

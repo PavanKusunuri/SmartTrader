@@ -188,7 +188,10 @@ class Portfolio:
         expected_realized = (
             sum(t.net_pnl for t in self.trades) + self.realized_pnl_carried_forward
         )
-        if abs(expected_realized - self.realized_pnl) > 0.01:
+        # Each trade's net_pnl is rounded to paise (up to 0.005 error apiece),
+        # while the ledger accumulates unrounded, so allow that drift per trade.
+        tolerance = 0.01 + 0.005 * len(self.trades)
+        if abs(expected_realized - self.realized_pnl) > tolerance:
             problems.append(
                 f"realized_pnl mismatch: ledger={self.realized_pnl} vs trades sum={expected_realized}"
             )

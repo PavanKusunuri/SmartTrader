@@ -15,6 +15,7 @@ from app.paper.portfolio import Portfolio
 class RiskManager:
     def __init__(self, limits: RiskLimits):
         self.limits = limits
+        self._peak_equity = 0.0
 
     def position_size(self, cash: float, entry_price: float, stop_loss: float) -> int:
         """Shares sized so that a stop-loss hit loses roughly
@@ -25,7 +26,8 @@ class RiskManager:
             return 0
 
         risk_budget = cash * self.limits.risk_per_trade_pct
-        stop_distance = entry_price - stop_loss
+        # Budget against a stop that fills worse than its level (gap/slippage).
+        stop_distance = (entry_price - stop_loss) + self.limits.gap_buffer_pct * entry_price
         qty_by_risk = int(risk_budget // stop_distance)
 
         max_position_value = cash * self.limits.max_position_pct
@@ -56,6 +58,14 @@ class RiskManager:
         equity = portfolio.equity(current_prices)
         if equity <= 0:
             return False, "portfolio equity is zero or negative"
+
+        self._peak_equity = max(self._peak_equity, equity)
+        drawdown = 1 - equity / self._peak_equity
+        if drawdown >= self.limits.max_drawdown_pct:
+            return False, (
+                f"max drawdown reached: {drawdown:.1%} below peak equity "
+                f"{self._peak_equity:.2f} (limit {self.limits.max_drawdown_pct:.0%})"
+            )
 
         new_exposure_value = (
             portfolio.existing_exposure_value(current_prices) + quantity * entry_price

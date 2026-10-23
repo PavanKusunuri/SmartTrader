@@ -81,7 +81,9 @@ def daily(symbol, day, o, h, l, c, quality=DataQuality.OK) -> Bar:
 def config():
     return AppConfig(
         starting_cash=100_000,
-        risk=RiskLimits(max_position_pct=1.0),
+        # gap buffer off: these tests are about persistence, and the buffer would
+        # shrink the order below the cost-viability size they rely on.
+        risk=RiskLimits(max_position_pct=1.0, gap_buffer_pct=0),
         swing=SwingStrategyConfig(fast_ma_period=2, slow_ma_period=4),
     )
 
