@@ -27,6 +27,10 @@ This is a research and paper-trading tool, not a promise of profit. No strategy 
 - Paper trading only in the initial version.
 - **Do not implement, call, or enable live order placement.** No live-order endpoint calls, no live-order buttons, and no code path that can accidentally submit real orders.
 - Do not request or store Groww credentials in version 1.
+- **Amendment, 2026-10-24 (user-authorised):** read-only Groww *market-data* credentials may be used, held only in the
+  user's local git-ignored `.env` (never in chat, logs or source). This covers historical candles and quotes via
+  `app/data/groww_client.py` ONLY. Order, smart-order, position and funds endpoints remain forbidden, and
+  `tests/test_groww_readonly_guard.py` enforces that. Live trading is still Milestone 6.
 - Do not bypass broker, exchange, data-provider, or regulatory controls.
 - Do not assume that paper-trading success predicts live results.
 - Add a prominent `PAPER TRADING — NO REAL ORDERS` label in the UI and logs.

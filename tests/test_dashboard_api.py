@@ -20,6 +20,7 @@ from app.strategies.swing import SwingMAStrategy
 
 from pathlib import Path
 
+LOCAL = "http://127.0.0.1:8000"  # browsers send a loopback Host; so do the tests
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "data" / "samples"
 
 
@@ -46,7 +47,7 @@ def populated_db(tmp_path_factory) -> str:
 
 @pytest.fixture
 def client(populated_db) -> TestClient:
-    return TestClient(create_app(db_path=populated_db, samples_dir=str(SAMPLES_DIR)))
+    return TestClient(create_app(db_path=populated_db, samples_dir=str(SAMPLES_DIR)), base_url=LOCAL)
 
 
 # --- Safety: read-only, no order placement ----------------------------------
@@ -161,7 +162,7 @@ def test_scanner_health_is_derived_from_actual_scan_history(client, tmp_path):
     )
     repo.close()
 
-    scanned_client = TestClient(create_app(db_path=str(db_path), samples_dir=str(SAMPLES_DIR)))
+    scanned_client = TestClient(create_app(db_path=str(db_path), samples_dir=str(SAMPLES_DIR)), base_url=LOCAL)
     scanner = {
         c["name"]: c for c in scanned_client.get("/api/health").json()["components"]
     }["Scanner"]
@@ -218,7 +219,7 @@ def test_absurd_paging_is_clamped_not_crashed(client):
 def test_missing_database_is_reported_not_crashed(tmp_path):
     """A missing ledger must give a usable dashboard that says what is wrong."""
     missing = tmp_path / "does_not_exist.db"
-    client = TestClient(create_app(db_path=str(missing), samples_dir=str(SAMPLES_DIR)))
+    client = TestClient(create_app(db_path=str(missing), samples_dir=str(SAMPLES_DIR)), base_url=LOCAL)
 
     # The page itself must still render so the user can read the problem.
     assert client.get("/").status_code == 200
@@ -233,7 +234,7 @@ def test_missing_database_is_reported_not_crashed(tmp_path):
 def test_empty_but_valid_database_reports_no_data(tmp_path):
     db_path = tmp_path / "empty.db"
     SqliteRepository(db_path).close()  # creates the schema, writes no rows
-    client = TestClient(create_app(db_path=str(db_path), samples_dir=str(SAMPLES_DIR)))
+    client = TestClient(create_app(db_path=str(db_path), samples_dir=str(SAMPLES_DIR)), base_url=LOCAL)
 
     overview = client.get("/api/overview")
     assert overview.status_code == 200
@@ -250,7 +251,7 @@ def test_outdated_schema_database_does_not_crash_the_dashboard(tmp_path):
     conn.commit()
     conn.close()
 
-    client = TestClient(create_app(db_path=str(db_path), samples_dir=str(SAMPLES_DIR)))
+    client = TestClient(create_app(db_path=str(db_path), samples_dir=str(SAMPLES_DIR)), base_url=LOCAL)
     assert client.get("/").status_code == 200
     assert client.get("/api/status").status_code == 200
     # Whatever the data endpoints do, they must not return a 500.

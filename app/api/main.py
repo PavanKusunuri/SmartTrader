@@ -38,6 +38,7 @@ from app.api.derive import (
     derive_order_economics,
     position_marks,
 )
+from app.api.security import LOOPBACK_HOSTS, LocalOnlyMiddleware
 from app.config import AppConfig
 from app.storage.sqlite import EXPLORABLE_TABLES
 
@@ -121,6 +122,8 @@ def create_app(
     db_path: str,
     samples_dir: str | None = None,
     bhavcopy_dir: str | None = None,
+    allowed_hosts: frozenset[str] = LOOPBACK_HOSTS,
+    enable_docs: bool = False,
 ) -> FastAPI:
     ledger_path = Path(db_path)
     data_dir = Path(samples_dir) if samples_dir else Path("data/samples")
@@ -163,9 +166,13 @@ def create_app(
             "No live orders, no broker integration."
         ),
         version="1.0.0",
-        docs_url="/api/docs",
-        openapi_url="/api/openapi.json",
+        # Interactive docs are off by default: they map every route for anyone
+        # who can reach the port. Opt in with enable_docs=True.
+        docs_url="/api/docs" if enable_docs else None,
+        redoc_url=None,
+        openapi_url="/api/openapi.json" if enable_docs else None,
     )
+    app.add_middleware(LocalOnlyMiddleware, allowed_hosts=allowed_hosts)
 
     # ------------------------------------------------------------ plumbing
 
@@ -1437,8 +1444,8 @@ def create_app(
         if not page.exists():
             return HTMLResponse(
                 "<h1>PAPER TRADING — NO REAL ORDERS</h1>"
-                "<p>Dashboard assets are missing. The JSON API is available at "
-                "<a href='/api/docs'>/api/docs</a>.</p>",
+                "<p>Dashboard assets are missing. Reinstall or restore "
+                "app/api/static.</p>",
                 status_code=200,
             )
         return HTMLResponse(page.read_text(encoding="utf-8"))

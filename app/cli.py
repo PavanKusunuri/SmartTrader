@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -387,6 +388,17 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "Every run starts flat. Pass --db to resume across runs."
         )
 
+    dispatcher = None
+    if args.alert:
+        from app.alerts.base import NullNotifier
+        from app.alerts.dispatch import AlertDispatcher
+        from app.alerts.telegram import load_notifier
+
+        notifier = load_notifier(args.env_file)
+        if isinstance(notifier, NullNotifier):
+            print("\nAlerts requested but Telegram is not enabled/configured; nothing will be sent.")
+        dispatcher = AlertDispatcher(notifier, repo)
+
     exit_code = 0
     for scan_number in range(1, args.repeat + 1):
         now = datetime.now(tz=IST) if args.now is None else datetime.fromisoformat(args.now)
@@ -425,6 +437,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     "errors": report.count(ScanOutcome.ERROR),
                 },
             )
+
+        if dispatcher is not None:
+            from app.alerts.dispatch import alerts_from_scan
+
+            counts = dispatcher.dispatch(alerts_from_scan(report, strategy.name))
+            print(f"\n  Alerts: {counts['sent']} sent, {counts['failed']} not delivered, "
+                  f"{counts['throttled']} throttled")
 
         # Save AFTER the orders/trades above are written, so the saved cash and
         # positions always correspond to fills already on record.
@@ -577,6 +596,8 @@ def cmd_check_env(args: argparse.Namespace) -> int:
         print(f"  {name}: {'set' if ok else 'not set'}")
     mode = creds.auth_mode()
     print(f"Auth mode: {mode or 'none complete'}")
+    for name in ("TELEGRAM_ENABLED", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        print(f"  {name}: {'set' if os.environ.get(name, '').strip() else 'not set'}")
     return 0 if mode else 1
 
 
@@ -629,6 +650,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 1
 
     from app.api.main import create_app
+    from app.api.security import LOOPBACK_HOSTS, is_loopback
+
+    allowed_hosts = LOOPBACK_HOSTS
+    if not is_loopback(args.host):
+        if not args.i_understand_no_auth:
+            print(
+                f"\nRefusing to bind {args.host!r}: that exposes an unauthenticated "
+                "dashboard to your network.\nUse 127.0.0.1 (default), or pass "
+                "--i-understand-no-auth if you really mean it."
+            )
+            return 2
+        allowed_hosts = LOOPBACK_HOSTS | {args.host.lower()}
+        print(f"\nWARNING: bound to {args.host} with NO authentication.")
 
     db_path = Path(args.db).resolve()
     print(f"\nLedger       : {db_path}")
@@ -665,6 +699,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             db_path=str(db_path),
             samples_dir=args.data_dir,
             bhavcopy_dir=args.bhavcopy_dir,
+            allowed_hosts=allowed_hosts,
+            enable_docs=args.enable_docs,
         ),
         host=args.host, port=args.port, log_level="info",
     )
@@ -754,6 +790,11 @@ def main(argv: list[str] | None = None) -> int:
         "--now", default=None,
         help="ISO timestamp to treat as 'now' (for testing against sample data)",
     )
+    sc.add_argument(
+        "--alert", action="store_true",
+        help="Send Telegram alerts for this scan (needs TELEGRAM_* in .env; off by default)",
+    )
+    sc.add_argument("--env-file", default=".env")
     sc.set_defaults(func=cmd_scan)
 
     rs = sub.add_parser("reset", help="Delete all simulated history (asks for confirmation)")
@@ -778,6 +819,15 @@ def main(argv: list[str] | None = None) -> int:
              "dashboard on your network; it has no authentication.",
     )
     sv.add_argument("--port", type=int, default=8000)
+    sv.add_argument(
+        "--i-understand-no-auth", action="store_true",
+        help="Required to bind a non-loopback --host. The dashboard has NO login; "
+             "anyone who can reach the port can read the ledger.",
+    )
+    sv.add_argument(
+        "--enable-docs", action="store_true",
+        help="Serve /api/docs and /api/openapi.json (off by default).",
+    )
     sv.set_defaults(func=cmd_serve)
 
     ib = sub.add_parser(
@@ -815,6 +865,22 @@ def main(argv: list[str] | None = None) -> int:
     ce = sub.add_parser("check-env", help="Check which Groww .env variables are set (no values shown)")
     ce.add_argument("--env-file", default=".env")
     ce.set_defaults(func=cmd_check_env)
+
+    from app.groww_cli import cmd_groww_fetch, cmd_groww_probe
+
+    gp = sub.add_parser("groww-probe", help="Measure what Groww candle data is actually available (read-only)")
+    gp.add_argument("--symbol", default="RELIANCE")
+    gp.add_argument("--interval", default="5m")
+    gp.add_argument("--env-file", default=".env")
+    gp.set_defaults(func=cmd_groww_probe)
+
+    gf = sub.add_parser("groww-fetch", help="Download Groww candles to CSV for scan/backtest (read-only)")
+    gf.add_argument("--symbols", required=True, help="comma-separated NSE symbols, e.g. RELIANCE,TCS")
+    gf.add_argument("--interval", default="1d")
+    gf.add_argument("--days", type=int, default=30)
+    gf.add_argument("--out", default="data/groww")
+    gf.add_argument("--env-file", default=".env")
+    gf.set_defaults(func=cmd_groww_fetch)
 
     args = parser.parse_args(argv)
     return args.func(args)

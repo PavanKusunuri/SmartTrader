@@ -474,6 +474,16 @@ class SqliteRepository:
         )
         self._conn.commit()
 
+    def event_exists(self, component: str, key: str, since_iso: str) -> bool:
+        """True if an event for `component` whose detail carries `"key": key` was
+        logged at or after `since_iso`. Used to throttle repeated alerts."""
+
+        row = self._conn.execute(
+            "SELECT 1 FROM app_events WHERE component = ? AND ts >= ? AND detail_json LIKE ? LIMIT 1",
+            (component, since_iso, f'%"key": {json.dumps(key)}%'),
+        ).fetchone()
+        return row is not None
+
     # ------------------------------------------------------------ ledger read
 
     def all_trades(self) -> list[sqlite3.Row]:

@@ -10,5 +10,5 @@ python-dotenv==1.2.4
 fastapi==0.160.0
 uvicorn==0.54.0
 
-# Test-only: FastAPI's TestClient requires httpx.
+# HTTP client for the read-only Groww data adapter and Telegram alerts (also used by FastAPI's TestClient).
 httpx==0.28.1

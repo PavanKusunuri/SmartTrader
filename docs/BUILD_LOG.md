@@ -789,3 +789,47 @@ Full suite: see run below.
   Parameters were NOT tuned to these numbers.
 - Not done: only one real trading day is imported, so no real or out-of-sample evaluation was possible;
   trailing stops, shorting, news/event filters and market breadth are absent.
+
+## Security hardening of the local dashboard (2026-10-24)
+
+- Added `app/api/security.py`: Host allowlist (DNS-rebinding), cross-site `/api/` guard, CSP and other headers.
+- `/api/docs` and `/api/openapi.json` off by default (`serve --enable-docs`).
+- `serve --host <non-loopback>` refused unless `--i-understand-no-auth`.
+- Inline Tailwind config moved to `static/tailwind-config.js` so CSP can forbid inline scripts.
+- Frontend `innerHTML` audit: no unescaped data-bearing sink found.
+- Tests: `tests/test_dashboard_security.py` (22 new); full suite 451 passed. Not browser-tested.
+- Not done: dependency vulnerability scan, hash-pinned requirements, absolute-path redaction.
+
+## Live-trading readiness review (2026-10-24) — research/design only
+- Added `docs/LIVE_TRADING_READINESS.md`: evidence-graded Groww facts (static IP, OCO/GTT, idempotency,
+  auth, limits), failure-scenario table, required controls, open questions.
+- No order code, no credentials, no network calls added. Live trading remains out of scope (Milestone 6).
+- Open: whether OCO runs while client is offline, IP-change rules, MIS auto square-off, SEBI/NSE primary text.
+
+## Read-only Groww data adapter + Telegram alerts (2026-10-24)
+
+User chose Groww as the forward-paper data source and Telegram for alerts. CLAUDE.md §3 got a narrow, dated
+amendment: read-only market-data credentials only; order endpoints still forbidden.
+
+**Built**
+- `app/data/groww_client.py`: 3-endpoint client (token, `/historical/candles`, `/live-data/quote`), allowlist
+  enforced at call time, bounded retries/backoff, no redirects, token never logged or in errors, RFC 6238 TOTP
+  without a new dependency. Endpoints/headers taken from reading the official SDK source (v1.5.0) as text.
+- `app/data/groww_provider.py`: `DataProvider` for NSE/BSE CASH candles; windowing to Groww's documented
+  per-request limits, dedupe, validation, provenance in `source`; quote labelled a REST snapshot, never streaming.
+- `app/groww_cli.py`: `groww-probe` (measures real history depth) and `groww-fetch` (merges into
+  `data/groww/<interval>/<SYMBOL>.csv` + `_manifest.json`, atomic writes) so scan/backtest read it unchanged.
+- `app/alerts/*`: Telegram notifier (off unless `TELEGRAM_ENABLED=true` + token + chat id), dispatcher with
+  cross-process throttling and local recording of every alert/failure; `scan --alert`.
+- Deliberately NOT using the `growwapi` SDK: it requires `pandas<3` (this project pins 3.1.0), adds ~12 packages
+  including a bare `google` package, and bundles order methods.
+
+**Verification run:** full suite 528 passed (451 before; 77 new, all mocked, no network). Static guard test fails
+if any order/position/funds path, SDK import, unknown outbound host, or unexpected HTTP-importing module appears.
+
+**NOT verified (needs your credentials and market hours)**
+- Nothing was run against the real Groww or Telegram services.
+- Groww's docs do not state candle timezone or open/close stamping; assumed IST/open and recorded in `source`.
+- Groww's docs conflict on intraday history depth: use `groww-probe`.
+- Whether the API-key approval flow / TOTP flow works as read from SDK source is unconfirmed.
+- Groww's token endpoint allows 150 requests/24h: do not authenticate in a tight loop.

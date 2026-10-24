@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from app.api.main import SOURCE_CAVEATS, _data_kind, create_app
 from app.storage.sqlite import SqliteRepository
 
+LOCAL = "http://127.0.0.1:8000"  # browsers send a loopback Host; so do the tests
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "data" / "samples"
 
 # A minimal UDiFF bhavcopy. Column names match the real 2024-07-08-onwards
@@ -80,13 +81,13 @@ def ledger(tmp_path) -> str:
 def client(ledger, bhavcopy_dir) -> TestClient:
     return TestClient(create_app(
         db_path=ledger, samples_dir=str(SAMPLES_DIR), bhavcopy_dir=str(bhavcopy_dir)
-    ))
+    ), base_url=LOCAL)
 
 
 @pytest.fixture
 def csv_only_client(ledger) -> TestClient:
     """No bhavcopy directory configured — the common case."""
-    return TestClient(create_app(db_path=ledger, samples_dir=str(SAMPLES_DIR)))
+    return TestClient(create_app(db_path=ledger, samples_dir=str(SAMPLES_DIR)), base_url=LOCAL)
 
 
 # --- labelling ---------------------------------------------------------------
@@ -189,7 +190,7 @@ def test_bhavcopy_watchlist_reports_a_bad_directory_without_a_500(ledger, tmp_pa
     empty.mkdir()
     bad_client = TestClient(create_app(
         db_path=ledger, samples_dir=str(SAMPLES_DIR), bhavcopy_dir=str(empty)
-    ))
+    ), base_url=LOCAL)
     body = bad_client.get("/api/marketdata/watchlist?source=bhavcopy").json()
 
     assert body["rows"] == []
